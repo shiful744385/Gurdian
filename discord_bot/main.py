@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from discord_bot.database import EconomyDatabase
+from discord_bot.database import EconomyDatabase, ShopItem
 
 
 logging.basicConfig(
@@ -68,6 +68,15 @@ bot = EconomyBot()
 economy_group = app_commands.Group(
     name="economy",
     description="Admin controls for the server economy",
+)
+shop_group = app_commands.Group(
+    name="shop",
+    description="Browse and buy items from the server shop",
+)
+economy_shop_group = app_commands.Group(
+    name="shop",
+    description="Manage the server shop",
+    parent=economy_group,
 )
 
 
@@ -188,6 +197,171 @@ async def leaderboard(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="history", description="View recent balance changes")
+@app_commands.describe(member="The member whose history you want to see")
+async def history(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+    target = member or interaction.user
+    entries = bot.database.balance_history(guild_id(interaction), target.id)
+    if not entries:
+        await interaction.response.send_message(
+            f"No balance history exists for **{target.display_name}** yet.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for entry in entries:
+        sign = "+" if entry.delta >= 0 else "-"
+        timestamp = datetime.fromtimestamp(entry.created_at, tz=timezone.utc)
+        lines.append(
+            f"`{sign}{format_amount(abs(entry.delta))}` — {entry.reason} "
+            f"({discord.utils.format_dt(timestamp, style='R')})"
+        )
+    embed = discord.Embed(
+        title=f"{target.display_name}'s balance history",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+def shop_role(guild: discord.Guild, role_id: int | None) -> discord.Role | None:
+    return guild.get_role(role_id) if role_id is not None else None
+
+
+def role_reward_is_available(guild: discord.Guild, role: discord.Role) -> bool:
+    me = guild.me
+    return (
+        me is not None
+        and me.guild_permissions.manage_roles
+        and role.is_assignable()
+    )
+
+
+def format_shop_item(item: ShopItem, guild: discord.Guild) -> str:
+    reward = ""
+    if item.role_id is not None:
+        role = shop_role(guild, item.role_id)
+        reward = f"\nRole reward: {role.mention if role else 'role no longer exists'}"
+    return f"**#{item.id} — {item.name}**\nPrice: {format_amount(item.price)}{reward}"
+
+
+@shop_group.command(name="list", description="Browse the items in this server's shop")
+async def shop_list(interaction: discord.Interaction) -> None:
+    if not await ensure_guild(interaction):
+        return
+    items = bot.database.list_shop_items(guild_id(interaction))
+    if not items:
+        await interaction.response.send_message(
+            "The shop is empty right now.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"{interaction.guild.name} shop",
+        description="Use `/shop buy` with an item number to purchase an item.",
+        color=discord.Color.gold(),
+    )
+    for item in items[:25]:
+        role = shop_role(interaction.guild, item.role_id)
+        reward = f"\nRole reward: {role.mention}" if role else ""
+        if item.role_id is not None and role is None:
+            reward = "\nRole reward: role no longer exists"
+        embed.add_field(
+            name=f"#{item.id} — {item.name}",
+            value=f"Price: **{format_amount(item.price)}**{reward}",
+            inline=False,
+        )
+    if len(items) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(items)} items. Use item numbers shown above.")
+    await interaction.response.send_message(embed=embed)
+
+
+@shop_group.command(name="buy", description="Purchase an item from the server shop")
+@app_commands.describe(item_id="The item number shown by /shop list")
+@app_commands.rename(item_id="item")
+async def shop_buy(
+    interaction: discord.Interaction,
+    item_id: app_commands.Range[int, 1, 2_147_483_647],
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+    item = bot.database.get_shop_item(guild_id(interaction), item_id)
+    if item is None:
+        await interaction.response.send_message(
+            "That shop item does not exist.",
+            ephemeral=True,
+        )
+        return
+
+    role = shop_role(interaction.guild, item.role_id)
+    if item.role_id is not None and (
+        role is None or not role_reward_is_available(interaction.guild, role)
+    ):
+        await interaction.response.send_message(
+            "This item's role reward is currently unavailable. Please ask a server admin to fix it.",
+            ephemeral=True,
+        )
+        return
+
+    success, purchased_item, new_balance = bot.database.purchase(
+        guild_id(interaction),
+        interaction.user.id,
+        item_id,
+    )
+    if not success:
+        if purchased_item is None:
+            message = "That shop item does not exist."
+        else:
+            message = (
+                f"You need **{format_amount(purchased_item.price)}**, but your balance is only "
+                f"**{format_amount(new_balance)}**."
+            )
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    if role is not None:
+        try:
+            await interaction.user.add_roles(
+                role,
+                reason=f"Shop purchase: {purchased_item.name if purchased_item else item.name}",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not grant role reward for shop item %s", item_id)
+            try:
+                bot.database.adjust_balance(
+                    guild_id(interaction),
+                    interaction.user.id,
+                    item.price,
+                    "shop purchase refund",
+                )
+            except Exception:
+                logger.exception("Could not refund failed shop role reward for item %s", item_id)
+                await interaction.response.send_message(
+                    "Your purchase was charged, but I could not grant the role reward. "
+                    "Please contact a server admin.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                "The role reward could not be granted, so your credits were refunded. "
+                "Please contact a server admin.",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.send_message(
+        f"You purchased **{item.name}** for **{format_amount(item.price)}**. "
+        f"Your new balance is **{format_amount(new_balance)}**."
+    )
+
+
 @bot.tree.command(name="serverinfo", description="Show useful information about this server")
 async def serverinfo(interaction: discord.Interaction) -> None:
     if not await ensure_guild(interaction):
@@ -278,6 +452,130 @@ async def economy_set(
     )
 
 
+@economy_shop_group.command(name="add", description="Add an item to the server shop")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    name="The item name",
+    price="The item's price in credits",
+    role="An optional role to grant when purchased",
+)
+async def economy_shop_add(
+    interaction: discord.Interaction,
+    name: app_commands.Range[str, 1, 100],
+    price: app_commands.Range[int, 1, 10_000_000],
+    role: discord.Role | None = None,
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+    if role is not None and not role_reward_is_available(interaction.guild, role):
+        await interaction.response.send_message(
+            "I cannot assign that role. Move it below my highest role and ensure I have Manage Roles.",
+            ephemeral=True,
+        )
+        return
+    try:
+        item = bot.database.create_shop_item(
+            guild_id(interaction),
+            name,
+            price,
+            role.id if role else None,
+        )
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    reward = f" and grants {role.mention}" if role else ""
+    await interaction.response.send_message(
+        f"Added shop item **#{item.id} — {item.name}** for **{format_amount(item.price)}**{reward}."
+    )
+
+
+@economy_shop_group.command(name="edit", description="Edit an item in the server shop")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    item_id="The item number shown by /shop list",
+    name="The new item name",
+    price="The new price in credits",
+    role="The new role reward",
+    clear_role="Remove the current role reward",
+)
+@app_commands.rename(item_id="item")
+async def economy_shop_edit(
+    interaction: discord.Interaction,
+    item_id: app_commands.Range[int, 1, 2_147_483_647],
+    name: app_commands.Range[str, 1, 100] | None = None,
+    price: app_commands.Range[int, 1, 10_000_000] | None = None,
+    role: discord.Role | None = None,
+    clear_role: bool = False,
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+    if role is not None and clear_role:
+        await interaction.response.send_message(
+            "Choose a role or clear the role reward, not both.",
+            ephemeral=True,
+        )
+        return
+    if name is None and price is None and role is None and not clear_role:
+        await interaction.response.send_message(
+            "Provide a new name, price, role, or set clear_role to true.",
+            ephemeral=True,
+        )
+        return
+    if role is not None and not role_reward_is_available(interaction.guild, role):
+        await interaction.response.send_message(
+            "I cannot assign that role. Move it below my highest role and ensure I have Manage Roles.",
+            ephemeral=True,
+        )
+        return
+    try:
+        item = bot.database.update_shop_item(
+            guild_id(interaction),
+            item_id,
+            name=name,
+            price=price,
+            role_id=None if clear_role else (role.id if role else EconomyDatabase._UNSET),
+        )
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    if item is None:
+        await interaction.response.send_message(
+            "That shop item does not exist.",
+            ephemeral=True,
+        )
+        return
+    reward = " with no role reward"
+    if item.role_id is not None:
+        reward_role = shop_role(interaction.guild, item.role_id)
+        reward = f" granting {reward_role.mention}" if reward_role else ""
+    await interaction.response.send_message(
+        f"Updated shop item **#{item.id} — {item.name}** to **{format_amount(item.price)}**{reward}."
+    )
+
+
+@economy_shop_group.command(name="remove", description="Remove an item from the server shop")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(item_id="The item number shown by /shop list")
+@app_commands.rename(item_id="item")
+async def economy_shop_remove(
+    interaction: discord.Interaction,
+    item_id: app_commands.Range[int, 1, 2_147_483_647],
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+    item = bot.database.get_shop_item(guild_id(interaction), item_id)
+    if item is None:
+        await interaction.response.send_message(
+            "That shop item does not exist.",
+            ephemeral=True,
+        )
+        return
+    bot.database.delete_shop_item(guild_id(interaction), item_id)
+    await interaction.response.send_message(
+        f"Removed shop item **#{item.id} — {item.name}**."
+    )
+
+
 @bot.tree.error
 async def on_app_command_error(
     interaction: discord.Interaction,
@@ -298,6 +596,7 @@ async def on_app_command_error(
 
 
 bot.tree.add_command(economy_group)
+bot.tree.add_command(shop_group)
 
 
 async def run() -> None:

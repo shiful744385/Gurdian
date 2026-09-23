@@ -21,6 +21,28 @@ class LeaderboardEntry:
     balance: int
 
 
+@dataclass(frozen=True)
+class ShopItem:
+    id: int
+    guild_id: int
+    name: str
+    price: int
+    role_id: int | None
+    created_at: int
+    updated_at: int
+
+
+@dataclass(frozen=True)
+class BalanceHistoryEntry:
+    transaction_id: int
+    from_user_id: int | None
+    to_user_id: int | None
+    amount: int
+    delta: int
+    reason: str
+    created_at: int
+
+
 class EconomyDatabase:
     def __init__(
         self,
@@ -60,6 +82,17 @@ class EconomyDatabase:
                     amount INTEGER NOT NULL CHECK (amount > 0),
                     reason TEXT NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    name TEXT NOT NULL COLLATE NOCASE,
+                    price INTEGER NOT NULL CHECK (price > 0),
+                    role_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE (guild_id, name)
                 );
                 """
             )
@@ -216,14 +249,22 @@ class EconomyDatabase:
                 """,
                 (new_balance, guild_id, user_id),
             )
-            connection.execute(
-                """
-                INSERT INTO economy_transactions
-                    (guild_id, to_user_id, amount, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (guild_id, user_id, abs(amount), reason, now),
-            )
+            if amount:
+                connection.execute(
+                    """
+                    INSERT INTO economy_transactions
+                        (guild_id, from_user_id, to_user_id, amount, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id,
+                        user_id if amount < 0 else None,
+                        user_id if amount > 0 else None,
+                        abs(amount),
+                        reason,
+                        now,
+                    ),
+                )
             return EconomyUser(guild_id, user_id, new_balance, row["last_daily"])
 
     def leaderboard(self, guild_id: int, limit: int = 10) -> list[LeaderboardEntry]:
@@ -239,3 +280,238 @@ class EconomyDatabase:
                 (guild_id, limit),
             ).fetchall()
             return [LeaderboardEntry(row["user_id"], row["balance"]) for row in rows]
+
+    @staticmethod
+    def _shop_item_from_row(row: sqlite3.Row) -> ShopItem:
+        return ShopItem(**dict(row))
+
+    @staticmethod
+    def _validate_shop_item(name: str, price: int) -> str:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Shop item names cannot be empty")
+        if len(normalized_name) > 100:
+            raise ValueError("Shop item names cannot exceed 100 characters")
+        if price <= 0:
+            raise ValueError("Shop item prices must be positive")
+        return normalized_name
+
+    def list_shop_items(self, guild_id: int) -> list[ShopItem]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, guild_id, name, price, role_id, created_at, updated_at
+                FROM shop_items
+                WHERE guild_id = ?
+                ORDER BY id ASC
+                """,
+                (guild_id,),
+            ).fetchall()
+            return [self._shop_item_from_row(row) for row in rows]
+
+    def get_shop_item(self, guild_id: int, item_id: int) -> ShopItem | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, guild_id, name, price, role_id, created_at, updated_at
+                FROM shop_items
+                WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, item_id),
+            ).fetchone()
+            return self._shop_item_from_row(row) if row else None
+
+    def create_shop_item(
+        self,
+        guild_id: int,
+        name: str,
+        price: int,
+        role_id: int | None = None,
+    ) -> ShopItem:
+        normalized_name = self._validate_shop_item(name, price)
+        now = self._now()
+        with self._lock, self._connect() as connection:
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO shop_items
+                        (guild_id, name, price, role_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (guild_id, normalized_name, price, role_id, now, now),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError("A shop item with that name already exists") from error
+            row = connection.execute(
+                """
+                SELECT id, guild_id, name, price, role_id, created_at, updated_at
+                FROM shop_items
+                WHERE id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Shop item could not be created")
+            return self._shop_item_from_row(row)
+
+    _UNSET = object()
+
+    def update_shop_item(
+        self,
+        guild_id: int,
+        item_id: int,
+        *,
+        name: str | None = None,
+        price: int | None = None,
+        role_id: int | None | object = _UNSET,
+    ) -> ShopItem | None:
+        with self._lock, self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT id, guild_id, name, price, role_id, created_at, updated_at
+                FROM shop_items
+                WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, item_id),
+            ).fetchone()
+            if current is None:
+                return None
+
+            next_name = self._validate_shop_item(
+                name if name is not None else current["name"],
+                price if price is not None else current["price"],
+            )
+            next_price = price if price is not None else current["price"]
+            next_role_id = current["role_id"] if role_id is self._UNSET else role_id
+            try:
+                connection.execute(
+                    """
+                    UPDATE shop_items
+                    SET name = ?, price = ?, role_id = ?, updated_at = ?
+                    WHERE guild_id = ? AND id = ?
+                    """,
+                    (next_name, next_price, next_role_id, self._now(), guild_id, item_id),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError("A shop item with that name already exists") from error
+            updated = connection.execute(
+                """
+                SELECT id, guild_id, name, price, role_id, created_at, updated_at
+                FROM shop_items
+                WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, item_id),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("Shop item could not be updated")
+            return self._shop_item_from_row(updated)
+
+    def delete_shop_item(self, guild_id: int, item_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM shop_items WHERE guild_id = ? AND id = ?",
+                (guild_id, item_id),
+            )
+            return cursor.rowcount == 1
+
+    def purchase(
+        self,
+        guild_id: int,
+        user_id: int,
+        item_id: int,
+    ) -> tuple[bool, ShopItem | None, int]:
+        """Atomically charge a member and record a shop purchase."""
+        now = self._now()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._ensure_user(connection, guild_id, user_id)
+            item_row = connection.execute(
+                """
+                SELECT id, guild_id, name, price, role_id, created_at, updated_at
+                FROM shop_items
+                WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, item_id),
+            ).fetchone()
+            if item_row is None:
+                return False, None, 0
+
+            item = self._shop_item_from_row(item_row)
+            account = connection.execute(
+                """
+                SELECT balance
+                FROM economy_users
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if account is None:
+                raise RuntimeError("Economy user could not be initialized")
+            if account["balance"] < item.price:
+                return False, item, account["balance"]
+
+            updated = connection.execute(
+                """
+                UPDATE economy_users
+                SET balance = balance - ?
+                WHERE guild_id = ? AND user_id = ? AND balance >= ?
+                """,
+                (item.price, guild_id, user_id, item.price),
+            )
+            if updated.rowcount != 1:
+                current = connection.execute(
+                    """
+                    SELECT balance
+                    FROM economy_users
+                    WHERE guild_id = ? AND user_id = ?
+                    """,
+                    (guild_id, user_id),
+                ).fetchone()
+                return False, item, current["balance"] if current else 0
+
+            connection.execute(
+                """
+                INSERT INTO economy_transactions
+                    (guild_id, from_user_id, amount, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    item.price,
+                    f"shop purchase: {item.name}",
+                    now,
+                ),
+            )
+            return True, item, account["balance"] - item.price
+
+    def balance_history(
+        self,
+        guild_id: int,
+        user_id: int,
+        limit: int = 10,
+    ) -> list[BalanceHistoryEntry]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id AS transaction_id,
+                    from_user_id,
+                    to_user_id,
+                    amount,
+                    CASE
+                        WHEN from_user_id = ? THEN -amount
+                        WHEN to_user_id = ? THEN amount
+                        ELSE 0
+                    END AS delta,
+                    reason,
+                    created_at
+                FROM economy_transactions
+                WHERE guild_id = ?
+                  AND (from_user_id = ? OR to_user_id = ?)
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, user_id, guild_id, user_id, user_id, limit),
+            ).fetchall()
+            return [BalanceHistoryEntry(**dict(row)) for row in rows]
