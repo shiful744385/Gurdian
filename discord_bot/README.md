@@ -8,6 +8,8 @@ Python Discord bot for server utilities and a persistent per-server economy.
 - `/daily` — claim 100 credits once every 24 hours
 - `/pay member amount` — transfer credits to another member
 - `/leaderboard` — see the top balances
+- `/hunt` — catch a random animal once per minute
+- `/inventory [member]` — view collected animals
 - `/history [member]` — view recent balance changes, including shop purchases
 - `/shop list` — browse this server's shop
 - `/shop buy item` — purchase a shop item with credits
@@ -19,7 +21,7 @@ Python Discord bot for server utilities and a persistent per-server economy.
 - `/economy shop edit item [name] [price] [role] [clear_role]` — edit a shop item (Manage Server)
 - `/economy shop remove item` — remove a shop item (Manage Server)
 
-Balances, balance history, and shop items are stored in `data/economy.sqlite3`. Each Discord server has an isolated economy.
+Balances, balance history, shop items, hunt cooldowns, and inventories are stored in `data/economy.sqlite3`. Each Discord server has an isolated economy and inventory.
 Shop purchases are charged atomically and are recorded in balance history. Role rewards require the bot to have
 Manage Roles and its highest role to be above the reward role.
 

@@ -43,6 +43,12 @@ class BalanceHistoryEntry:
     created_at: int
 
 
+@dataclass(frozen=True)
+class InventoryEntry:
+    animal: str
+    quantity: int
+
+
 class EconomyDatabase:
     def __init__(
         self,
@@ -93,6 +99,21 @@ class EconomyDatabase:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE (guild_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS inventory (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    animal TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+                    PRIMARY KEY (guild_id, user_id, animal)
+                );
+
+                CREATE TABLE IF NOT EXISTS hunt_cooldowns (
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    last_hunt INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
                 );
                 """
             )
@@ -515,3 +536,77 @@ class EconomyDatabase:
                 (user_id, user_id, guild_id, user_id, user_id, limit),
             ).fetchall()
             return [BalanceHistoryEntry(**dict(row)) for row in rows]
+
+    def record_hunt(
+        self,
+        guild_id: int,
+        user_id: int,
+        animal: str,
+        quantity: int,
+        cooldown_seconds: int = 60,
+    ) -> tuple[bool, int, int]:
+        """Record a hunt atomically and return (claimed, remaining, new_quantity)."""
+        now = self._now()
+        normalized_animal = animal.strip().lower()
+        if not normalized_animal:
+            raise ValueError("Animal names cannot be empty")
+        if quantity <= 0:
+            raise ValueError("Hunt quantity must be positive")
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            last_hunt_row = connection.execute(
+                """
+                SELECT last_hunt
+                FROM hunt_cooldowns
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if last_hunt_row is not None:
+                elapsed = now - last_hunt_row["last_hunt"]
+                if elapsed < cooldown_seconds:
+                    return False, cooldown_seconds - elapsed, 0
+
+            connection.execute(
+                """
+                INSERT INTO hunt_cooldowns (guild_id, user_id, last_hunt)
+                VALUES (?, ?, ?)
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET last_hunt = excluded.last_hunt
+                """,
+                (guild_id, user_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO inventory (guild_id, user_id, animal, quantity)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (guild_id, user_id, animal)
+                DO UPDATE SET quantity = inventory.quantity + excluded.quantity
+                """,
+                (guild_id, user_id, normalized_animal, quantity),
+            )
+            inventory_row = connection.execute(
+                """
+                SELECT quantity
+                FROM inventory
+                WHERE guild_id = ? AND user_id = ? AND animal = ?
+                """,
+                (guild_id, user_id, normalized_animal),
+            ).fetchone()
+            if inventory_row is None:
+                raise RuntimeError("Hunt inventory could not be updated")
+            return True, 0, inventory_row["quantity"]
+
+    def get_inventory(self, guild_id: int, user_id: int) -> list[InventoryEntry]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT animal, quantity
+                FROM inventory
+                WHERE guild_id = ? AND user_id = ? AND quantity > 0
+                ORDER BY quantity DESC, animal ASC
+                """,
+                (guild_id, user_id),
+            ).fetchall()
+            return [InventoryEntry(**dict(row)) for row in rows]

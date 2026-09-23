@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -20,6 +21,15 @@ logger = logging.getLogger("discord_economy_bot")
 
 STARTING_BALANCE = 250
 DAILY_REWARD = 100
+HUNT_COOLDOWN_SECONDS = 60
+HUNT_ANIMALS = (
+    "rabbit",
+    "deer",
+    "fox",
+    "boar",
+    "wolf",
+    "bear",
+)
 COIN_NAME = os.getenv("ECONOMY_CURRENCY_NAME", "credits")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
@@ -194,6 +204,63 @@ async def leaderboard(interaction: discord.Interaction) -> None:
         description="\n".join(lines),
         color=discord.Color.blurple(),
     )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="hunt", description="Go hunting and add an animal to your inventory")
+async def hunt(interaction: discord.Interaction) -> None:
+    if not await ensure_guild(interaction):
+        return
+    animal = random.choice(HUNT_ANIMALS)
+    quantity = random.randint(1, 3)
+    claimed, remaining, total = bot.database.record_hunt(
+        guild_id(interaction),
+        interaction.user.id,
+        animal,
+        quantity,
+        HUNT_COOLDOWN_SECONDS,
+    )
+    if not claimed:
+        await interaction.response.send_message(
+            f"You are still preparing for your next hunt. Try again in "
+            f"**{format_duration(remaining)}**.",
+            ephemeral=True,
+        )
+        return
+    animal_label = animal.capitalize() if quantity == 1 else f"{animal.capitalize()}s"
+    await interaction.response.send_message(
+        f"You caught **{quantity} {animal_label}**. "
+        f"You now have **{total}** in your inventory."
+    )
+
+
+@bot.tree.command(name="inventory", description="View your hunting inventory")
+@app_commands.describe(member="The member whose inventory you want to see")
+async def inventory(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+    target = member or interaction.user
+    entries = bot.database.get_inventory(guild_id(interaction), target.id)
+    if not entries:
+        await interaction.response.send_message(
+            f"**{target.display_name}** has an empty hunting inventory. Use `/hunt` to start.",
+            ephemeral=True,
+        )
+        return
+
+    total_items = sum(entry.quantity for entry in entries)
+    description = "\n".join(
+        f"**{entry.animal.capitalize()}** — {entry.quantity}" for entry in entries
+    )
+    embed = discord.Embed(
+        title=f"{target.display_name}'s hunting inventory",
+        description=description,
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"{total_items} total animals")
     await interaction.response.send_message(embed=embed)
 
 
