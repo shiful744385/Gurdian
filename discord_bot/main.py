@@ -77,6 +77,7 @@ class EconomyBot(commands.Bot):
 
 bot = EconomyBot()
 active_mines_games: dict[tuple[int, int], dict[str, object]] = {}
+active_wheels: dict[tuple[int, int], "WheelView"] = {}
 economy_group = app_commands.Group(
     name="economy",
     description="Admin controls for the server economy",
@@ -502,6 +503,127 @@ class MineView(discord.ui.View):
             button.disabled = True
 
 
+class WheelView(discord.ui.View):
+    WHEEL_OUTCOMES = (
+        ("💀", 0.0, 30),
+        ("1.2x", 1.2, 20),
+        ("1.5x", 1.5, 15),
+        ("2x", 2.0, 12),
+        ("3x", 3.0, 8),
+        ("5x", 5.0, 5),
+        ("7x", 7.0, 2),
+        ("10x", 10.0, 1),
+    )
+
+    def __init__(self, guild_id: int, user_id: int, bet: int) -> None:
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.bet = bet
+        self._lock = asyncio.Lock()
+        self._spinning = False
+
+        spin_button = discord.ui.Button(
+            label="🎡 SPIN",
+            style=discord.ButtonStyle.primary,
+        )
+        spin_button.callback = self.spin
+        self.add_item(spin_button)
+        active_wheels[(guild_id, user_id)] = self
+
+    async def spin(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ This is not your wheel!",
+                ephemeral=True,
+            )
+            return
+
+        game_key = (self.guild_id, self.user_id)
+        if active_wheels.get(game_key) is not self:
+            await interaction.response.send_message(
+                "❌ You don't have an active Mega Wheel!",
+                ephemeral=True,
+            )
+            return
+
+        async with self._lock:
+            if self._spinning:
+                await interaction.response.send_message(
+                    "⚠️ Your wheel is already spinning!",
+                    ephemeral=True,
+                )
+                return
+            self._spinning = True
+
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(
+                content="🎡 **Wheel is spinning...**\n\n"
+                "🔄 🔄 🔄 🔄 🔄",
+                embed=None,
+                view=self,
+            )
+
+            await asyncio.sleep(2)
+
+            result_index = random.choices(
+                range(len(self.WHEEL_OUTCOMES)),
+                weights=[outcome[2] for outcome in self.WHEEL_OUTCOMES],
+                k=1,
+            )[0]
+            symbol, multiplier, _ = self.WHEEL_OUTCOMES[result_index]
+            winnings = int(self.bet * multiplier)
+
+            if multiplier == 0:
+                result_text = (
+                    "💥 **BOOM!**\n\n"
+                    f"💸 You lost **{format_amount(self.bet)}**"
+                )
+                color = discord.Color.red()
+            else:
+                bot.database.settle_payout(
+                    self.guild_id,
+                    self.user_id,
+                    winnings,
+                    "megawheel payout",
+                )
+                result_text = (
+                    f"🎉 **You won!**\n\n"
+                    f"🎯 Multiplier: **{multiplier:g}x**\n"
+                    f"💰 Won: **{format_amount(winnings)}**"
+                )
+                color = discord.Color.gold()
+
+            active_wheels.pop(game_key, None)
+            embed = discord.Embed(
+                title="🎡 MEGA WHEEL",
+                description=(
+                    f"{interaction.user.mention}\n\n"
+                    f"🎯 Result: **{symbol}**\n\n"
+                    f"{result_text}"
+                ),
+                color=color,
+            )
+            await interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                view=self,
+            )
+
+    async def on_timeout(self) -> None:
+        game_key = (self.guild_id, self.user_id)
+        if active_wheels.pop(game_key, None) is self and not self._spinning:
+            bot.database.settle_payout(
+                self.guild_id,
+                self.user_id,
+                self.bet,
+                "megawheel timeout refund",
+            )
+        for item in self.children:
+            item.disabled = True
+
+
 @bot.tree.command(name="mine", description="Play Mines and win credits")
 @app_commands.describe(
     bet="Amount to bet",
@@ -546,6 +668,50 @@ async def mine(
             f"💵 Cash Out: **{format_amount(0)} (0.00x)**\n"
             f"📈 Next: **{format_amount(int(bet * MINES_MULTIPLIER_STEP))} "
             f"(1.41x)**"
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+@bot.tree.command(name="megawheel", description="Spin the Mega Wheel")
+@app_commands.describe(bet="Amount of credits to bet")
+async def megawheel(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 10_000_000],
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+
+    game_key = (guild_id(interaction), interaction.user.id)
+    if game_key in active_wheels:
+        await interaction.response.send_message(
+            "❌ You already have an active Mega Wheel!",
+            ephemeral=True,
+        )
+        return
+
+    placed, balance = bot.database.place_bet(
+        guild_id(interaction),
+        interaction.user.id,
+        bet,
+        "megawheel bet",
+    )
+    if not placed:
+        await interaction.response.send_message(
+            f"❌ You don't have enough money!\n"
+            f"💰 Your balance: **{format_amount(balance)}**",
+            ephemeral=True,
+        )
+        return
+
+    view = WheelView(guild_id(interaction), interaction.user.id, bet)
+    embed = discord.Embed(
+        title="🎡 MEGA WHEEL",
+        description=(
+            f"{interaction.user.mention} started a Mega Wheel spin.\n\n"
+            f"💰 Bet: **{format_amount(bet)}**\n"
+            "Press **🎡 SPIN** to spin the wheel."
         ),
         color=discord.Color.blurple(),
     )

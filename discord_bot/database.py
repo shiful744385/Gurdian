@@ -238,15 +238,16 @@ class EconomyDatabase:
             )
             return True, sender["balance"] - amount
 
-    def place_mines_bet(
+    def place_bet(
         self,
         guild_id: int,
         user_id: int,
         amount: int,
+        reason: str,
     ) -> tuple[bool, int]:
-        """Atomically debit a Mines bet and return (placed, new_balance)."""
+        """Atomically debit a game bet and return (placed, new_balance)."""
         if amount <= 0:
-            raise ValueError("Mines bets must be positive")
+            raise ValueError("Game bets must be positive")
         now = self._now()
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -274,9 +275,9 @@ class EconomyDatabase:
                 """
                 INSERT INTO economy_transactions
                     (guild_id, from_user_id, amount, reason, created_at)
-                VALUES (?, ?, ?, 'mines bet', ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (guild_id, user_id, amount, now),
+                (guild_id, user_id, amount, reason, now),
             )
             row = connection.execute(
                 """
@@ -287,19 +288,19 @@ class EconomyDatabase:
                 (guild_id, user_id),
             ).fetchone()
             if row is None:
-                raise RuntimeError("Mines bet balance could not be read")
+                raise RuntimeError("Game bet balance could not be read")
             return True, row["balance"]
 
-    def settle_mines_payout(
+    def settle_payout(
         self,
         guild_id: int,
         user_id: int,
         amount: int,
         reason: str,
     ) -> EconomyUser:
-        """Atomically credit a Mines payout and record it in balance history."""
+        """Atomically credit a game payout and record it in balance history."""
         if amount <= 0:
-            raise ValueError("Mines payouts must be positive")
+            raise ValueError("Game payouts must be positive")
         now = self._now()
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -329,8 +330,27 @@ class EconomyDatabase:
                 (guild_id, user_id),
             ).fetchone()
             if row is None:
-                raise RuntimeError("Mines payout balance could not be read")
+                raise RuntimeError("Game payout balance could not be read")
             return EconomyUser(**dict(row))
+
+    def place_mines_bet(
+        self,
+        guild_id: int,
+        user_id: int,
+        amount: int,
+    ) -> tuple[bool, int]:
+        """Atomically debit a Mines bet and return (placed, new_balance)."""
+        return self.place_bet(guild_id, user_id, amount, "mines bet")
+
+    def settle_mines_payout(
+        self,
+        guild_id: int,
+        user_id: int,
+        amount: int,
+        reason: str,
+    ) -> EconomyUser:
+        """Atomically credit a Mines payout and record it in balance history."""
+        return self.settle_payout(guild_id, user_id, amount, reason)
 
     def adjust_balance(
         self,
