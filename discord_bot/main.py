@@ -78,6 +78,7 @@ class EconomyBot(commands.Bot):
 bot = EconomyBot()
 active_mines_games: dict[tuple[int, int], dict[str, object]] = {}
 active_wheels: dict[tuple[int, int], "WheelView"] = {}
+active_aviator: dict[tuple[int, int], dict[str, object]] = {}
 economy_group = app_commands.Group(
     name="economy",
     description="Admin controls for the server economy",
@@ -624,6 +625,162 @@ class WheelView(discord.ui.View):
             item.disabled = True
 
 
+class AviatorView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int) -> None:
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        cashout = discord.ui.Button(
+            label="💰 CASH OUT",
+            style=discord.ButtonStyle.success,
+        )
+        cashout.callback = self.cashout
+        self.add_item(cashout)
+
+    async def cashout(self, interaction: discord.Interaction) -> None:
+        game_key = (self.guild_id, self.user_id)
+        game = active_aviator.get(game_key)
+        if game is None:
+            await interaction.response.send_message(
+                "❌ No active Aviator game!",
+                ephemeral=True,
+            )
+            return
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ This is not your game!",
+                ephemeral=True,
+            )
+            return
+
+        lock = game["lock"]
+        if not isinstance(lock, asyncio.Lock):
+            raise RuntimeError("Aviator game lock is missing")
+        async with lock:
+            if active_aviator.get(game_key) is not game:
+                await interaction.response.send_message(
+                    "❌ No active Aviator game!",
+                    ephemeral=True,
+                )
+                return
+            if game["cashed_out"]:
+                await interaction.response.send_message(
+                    "❌ You already cashed out!",
+                    ephemeral=True,
+                )
+                return
+
+            multiplier = game["multiplier"]
+            bet = game["bet"]
+            if not isinstance(multiplier, float) or not isinstance(bet, int):
+                raise RuntimeError("Aviator game state is invalid")
+
+            winnings = int(bet * multiplier)
+            game["cashed_out"] = True
+            bot.database.settle_payout(
+                self.guild_id,
+                self.user_id,
+                winnings,
+                "aviator cash out",
+            )
+
+            for button in self.children:
+                button.disabled = True
+
+            embed = discord.Embed(
+                title="✈️ AVIATOR",
+                description=(
+                    f"{interaction.user.mention}\n\n"
+                    f"💰 Bet: **{format_amount(bet)}**\n"
+                    f"📈 Cash Out: **{multiplier:.2f}x**\n\n"
+                    f"🎉 You won **{format_amount(winnings)}**!"
+                ),
+                color=discord.Color.green(),
+            )
+            active_aviator.pop(game_key, None)
+            await interaction.response.edit_message(embed=embed, view=self)
+
+
+async def aviator_flight(
+    message: discord.Message,
+    guild_id: int,
+    user_id: int,
+) -> None:
+    game_key = (guild_id, user_id)
+    game = active_aviator.get(game_key)
+    if game is None:
+        return
+
+    crash_point = round(random.uniform(1.10, 8.00), 2)
+    lock = game["lock"]
+    if not isinstance(lock, asyncio.Lock):
+        raise RuntimeError("Aviator game lock is missing")
+
+    async with lock:
+        if active_aviator.get(game_key) is not game or game["cashed_out"]:
+            return
+        game["crash_point"] = crash_point
+
+    while True:
+        async with lock:
+            if active_aviator.get(game_key) is not game or game["cashed_out"]:
+                return
+
+            multiplier = game["multiplier"]
+            bet = game["bet"]
+            if not isinstance(multiplier, float) or not isinstance(bet, int):
+                raise RuntimeError("Aviator game state is invalid")
+
+            if multiplier >= crash_point:
+                break
+
+            multiplier = round(multiplier + 0.05, 2)
+            game["multiplier"] = multiplier
+            embed = discord.Embed(
+                title="✈️ AVIATOR",
+                description=(
+                    f"<@{user_id}>\n\n"
+                    "✈️ **Plane is flying...**\n\n"
+                    f"📈 Multiplier: **{multiplier:.2f}x**\n"
+                    f"💰 Bet: **{format_amount(bet)}**\n"
+                    f"💵 Cash Out: **{format_amount(int(bet * multiplier))}**\n\n"
+                    "👇 Cash out before the plane crashes!"
+                ),
+                color=discord.Color.blurple(),
+            )
+            try:
+                await message.edit(embed=embed, view=game["view"])
+            except discord.HTTPException:
+                active_aviator.pop(game_key, None)
+                return
+
+        await asyncio.sleep(0.35)
+
+    async with lock:
+        if active_aviator.get(game_key) is not game or game["cashed_out"]:
+            return
+
+        for button in game["view"].children:
+            button.disabled = True
+        embed = discord.Embed(
+            title="💥 CRASH!",
+            description=(
+                f"<@{user_id}>\n\n"
+                "✈️ The plane crashed!\n\n"
+                f"💥 Crash Point: **{crash_point:.2f}x**\n"
+                f"💸 Lost: **{format_amount(game['bet'])}**\n\n"
+                "😢 You didn't cash out in time."
+            ),
+            color=discord.Color.red(),
+        )
+        active_aviator.pop(game_key, None)
+        try:
+            await message.edit(embed=embed, view=game["view"])
+        except discord.HTTPException:
+            return
+
+
 @bot.tree.command(name="mine", description="Play Mines and win credits")
 @app_commands.describe(
     bet="Amount to bet",
@@ -716,6 +873,83 @@ async def megawheel(
         color=discord.Color.blurple(),
     )
     await interaction.response.send_message(embed=embed, view=view)
+
+
+@bot.tree.command(name="aviator", description="Play Aviator crash game")
+@app_commands.describe(bet="Amount of credits to bet")
+async def aviator(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 10_000_000],
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+
+    game_key = (guild_id(interaction), interaction.user.id)
+    if game_key in active_aviator:
+        await interaction.response.send_message(
+            "❌ You already have an Aviator game running!",
+            ephemeral=True,
+        )
+        return
+
+    placed, balance = bot.database.place_bet(
+        guild_id(interaction),
+        interaction.user.id,
+        bet,
+        "aviator bet",
+    )
+    if not placed:
+        await interaction.response.send_message(
+            f"❌ Not enough credits!\n\n"
+            f"💰 Your balance: **{format_amount(balance)}**",
+            ephemeral=True,
+        )
+        return
+
+    view = AviatorView(guild_id(interaction), interaction.user.id)
+    game = {
+        "user_id": interaction.user.id,
+        "bet": bet,
+        "multiplier": 1.00,
+        "crash_point": 0.0,
+        "cashed_out": False,
+        "view": view,
+        "lock": asyncio.Lock(),
+    }
+    active_aviator[game_key] = game
+
+    embed = discord.Embed(
+        title="✈️ AVIATOR",
+        description=(
+            f"{interaction.user.mention}\n\n"
+            "✈️ **Plane is taking off!**\n\n"
+            f"💰 Bet: **{format_amount(bet)}**\n"
+            "📈 Multiplier: **1.00x**\n\n"
+            "💰 Press **CASH OUT** before the plane crashes!"
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+    try:
+        message = await interaction.original_response()
+    except discord.HTTPException:
+        active_aviator.pop(game_key, None)
+        bot.database.settle_payout(
+            guild_id(interaction),
+            interaction.user.id,
+            bet,
+            "aviator message failure refund",
+        )
+        return
+
+    asyncio.create_task(
+        aviator_flight(
+            message,
+            guild_id(interaction),
+            interaction.user.id,
+        )
+    )
 
 
 @bot.tree.command(name="history", description="View recent balance changes")
