@@ -547,7 +547,7 @@ class EconomyDatabase:
     ) -> tuple[bool, int, int]:
         """Record a hunt atomically and return (claimed, remaining, new_quantity)."""
         now = self._now()
-        normalized_animal = animal.strip().lower()
+        normalized_animal = animal.strip()
         if not normalized_animal:
             raise ValueError("Animal names cannot be empty")
         if quantity <= 0:
@@ -563,7 +563,7 @@ class EconomyDatabase:
                 """,
                 (guild_id, user_id),
             ).fetchone()
-            if last_hunt_row is not None:
+            if cooldown_seconds > 0 and last_hunt_row is not None:
                 elapsed = now - last_hunt_row["last_hunt"]
                 if elapsed < cooldown_seconds:
                     return False, cooldown_seconds - elapsed, 0
