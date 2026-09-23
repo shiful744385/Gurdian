@@ -31,6 +31,8 @@ HUNT_ANIMALS = (
 )
 COIN_NAME = os.getenv("ECONOMY_CURRENCY_NAME", "credits")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+MINES_SQUARES = 9
+MINES_MULTIPLIER_STEP = 1.41
 
 
 def format_amount(amount: int) -> str:
@@ -74,6 +76,7 @@ class EconomyBot(commands.Bot):
 
 
 bot = EconomyBot()
+active_mines_games: dict[tuple[int, int], dict[str, object]] = {}
 economy_group = app_commands.Group(
     name="economy",
     description="Admin controls for the server economy",
@@ -261,6 +264,292 @@ async def inventory(
         color=discord.Color.green(),
     )
     await interaction.response.send_message(embed=embed)
+
+
+class MineButton(discord.ui.Button):
+    def __init__(self, position: int) -> None:
+        super().__init__(
+            label="❓",
+            style=discord.ButtonStyle.secondary,
+            row=position // 3,
+        )
+        self.position = position
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, MineView):
+            await interaction.response.send_message(
+                "❌ This Mines game is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        game_key = (view.guild_id, view.user_id)
+        game = active_mines_games.get(game_key)
+        if game is None:
+            await interaction.response.send_message(
+                "❌ You don't have an active Mines game!",
+                ephemeral=True,
+            )
+            return
+        if interaction.user.id != view.user_id:
+            await interaction.response.send_message(
+                "❌ This is not your game!",
+                ephemeral=True,
+            )
+            return
+
+        lock = game["lock"]
+        if not isinstance(lock, asyncio.Lock):
+            raise RuntimeError("Mines game lock is missing")
+        async with lock:
+            if self.position in game["opened"]:
+                await interaction.response.send_message(
+                    "⚠️ You already opened this!",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+            mines = game["mines"]
+            opened = game["opened"]
+            bet = game["bet"]
+            if not isinstance(mines, set) or not isinstance(opened, set):
+                raise RuntimeError("Mines game state is invalid")
+            if not isinstance(bet, int):
+                raise RuntimeError("Mines bet is invalid")
+
+            if self.position in mines:
+                for button in view.children:
+                    if isinstance(button, MineButton):
+                        if button.position in mines:
+                            button.label = "💣"
+                            button.style = discord.ButtonStyle.danger
+                        elif button.position in opened:
+                            button.label = "💎"
+                            button.style = discord.ButtonStyle.success
+                        button.disabled = True
+
+                embed = discord.Embed(
+                    title="💣 BOOM!",
+                    description=(
+                        f"{interaction.user.mention}\n\n"
+                        f"💥 You hit a mine!\n"
+                        f"💸 Lost: **{format_amount(bet)}**"
+                    ),
+                    color=discord.Color.red(),
+                )
+                active_mines_games.pop(game_key, None)
+                await interaction.edit_original_response(embed=embed, view=view)
+                return
+
+            opened.add(self.position)
+            self.label = "💎"
+            self.style = discord.ButtonStyle.success
+            self.disabled = True
+
+            multiplier = game["multiplier"]
+            if not isinstance(multiplier, float):
+                raise RuntimeError("Mines multiplier is invalid")
+            multiplier *= MINES_MULTIPLIER_STEP
+            game["multiplier"] = multiplier
+            current_win = int(bet * multiplier)
+
+            mines_count = game["mines_count"]
+            if not isinstance(mines_count, int):
+                raise RuntimeError("Mines count is invalid")
+            safe_count = MINES_SQUARES - mines_count
+
+            if len(opened) >= safe_count:
+                for button in view.children:
+                    if isinstance(button, MineButton):
+                        if button.position in mines:
+                            button.label = "💣"
+                            button.style = discord.ButtonStyle.danger
+                        button.disabled = True
+
+                bot.database.settle_mines_payout(
+                    view.guild_id,
+                    view.user_id,
+                    current_win,
+                    "mines win",
+                )
+                embed = discord.Embed(
+                    title="🏆 MINES WIN!",
+                    description=(
+                        f"{interaction.user.mention}\n\n"
+                        f"💎 All safe squares found!\n"
+                        f"📈 Multiplier: **{multiplier:.2f}x**\n"
+                        f"💰 Won: **{format_amount(current_win)}**"
+                    ),
+                    color=discord.Color.gold(),
+                )
+                active_mines_games.pop(game_key, None)
+                await interaction.edit_original_response(embed=embed, view=view)
+                return
+
+            embed = discord.Embed(
+                title="💣 Mines",
+                description=(
+                    f"{interaction.user.mention}\n\n"
+                    f"💰 Bet: **{format_amount(bet)}**\n"
+                    f"💵 Cash Out: **{format_amount(current_win)}** "
+                    f"(**{multiplier:.2f}x**)\n\n"
+                    f"💎 Safe: **{len(opened)}**"
+                ),
+                color=discord.Color.blurple(),
+            )
+            await interaction.edit_original_response(embed=embed, view=view)
+
+
+class CashOutButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(
+            label="💵 Cash Out",
+            style=discord.ButtonStyle.success,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, MineView):
+            await interaction.response.send_message(
+                "❌ This Mines game is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        game_key = (view.guild_id, view.user_id)
+        game = active_mines_games.get(game_key)
+        if game is None:
+            await interaction.response.send_message(
+                "❌ You don't have an active Mines game!",
+                ephemeral=True,
+            )
+            return
+        if interaction.user.id != view.user_id:
+            await interaction.response.send_message(
+                "❌ This is not your game!",
+                ephemeral=True,
+            )
+            return
+
+        lock = game["lock"]
+        if not isinstance(lock, asyncio.Lock):
+            raise RuntimeError("Mines game lock is missing")
+        async with lock:
+            multiplier = game["multiplier"]
+            bet = game["bet"]
+            if not isinstance(multiplier, float) or not isinstance(bet, int):
+                raise RuntimeError("Mines game state is invalid")
+            current_win = int(bet * multiplier)
+            bot.database.settle_mines_payout(
+                view.guild_id,
+                view.user_id,
+                current_win,
+                "mines cash out",
+            )
+
+            for button in view.children:
+                button.disabled = True
+
+            embed = discord.Embed(
+                title="💵 CASH OUT!",
+                description=(
+                    f"{interaction.user.mention}\n\n"
+                    f"📈 Multiplier: **{multiplier:.2f}x**\n"
+                    f"💰 Cashed out: **{format_amount(current_win)}**"
+                ),
+                color=discord.Color.green(),
+            )
+            active_mines_games.pop(game_key, None)
+            await interaction.response.edit_message(embed=embed, view=view)
+
+
+class MineView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int,
+        mines_count: int,
+        bet: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        mine_positions = random.sample(range(MINES_SQUARES), mines_count)
+        active_mines_games[(guild_id, user_id)] = {
+            "user_id": user_id,
+            "bet": bet,
+            "mines": set(mine_positions),
+            "opened": set(),
+            "mines_count": mines_count,
+            "multiplier": 1.0,
+            "lock": asyncio.Lock(),
+        }
+
+        for position in range(MINES_SQUARES):
+            self.add_item(MineButton(position))
+        self.add_item(CashOutButton())
+
+    async def on_timeout(self) -> None:
+        game_key = (self.guild_id, self.user_id)
+        game = active_mines_games.pop(game_key, None)
+        if game is None:
+            return
+        for button in self.children:
+            button.disabled = True
+
+
+@bot.tree.command(name="mine", description="Play Mines and win credits")
+@app_commands.describe(
+    bet="Amount to bet",
+    mines="Number of mines (1-8)",
+)
+async def mine(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 10_000_000],
+    mines: app_commands.Range[int, 1, 8] = 3,
+) -> None:
+    if not await ensure_guild(interaction):
+        return
+
+    game_key = (guild_id(interaction), interaction.user.id)
+    if game_key in active_mines_games:
+        await interaction.response.send_message(
+            "❌ You already have an active Mines game!",
+            ephemeral=True,
+        )
+        return
+
+    placed, balance = bot.database.place_mines_bet(
+        guild_id(interaction),
+        interaction.user.id,
+        bet,
+    )
+    if not placed:
+        await interaction.response.send_message(
+            f"❌ You don't have enough money!\n"
+            f"💰 Your balance: **{format_amount(balance)}**",
+            ephemeral=True,
+        )
+        return
+
+    view = MineView(guild_id(interaction), interaction.user.id, mines, bet)
+    embed = discord.Embed(
+        title="💣 Mines",
+        description=(
+            f"{interaction.user.mention} started a Mines game.\n\n"
+            f"💰 Bet: **{format_amount(bet)}**\n"
+            f"💣 Mines: **{mines}**\n"
+            f"💵 Cash Out: **{format_amount(0)} (0.00x)**\n"
+            f"📈 Next: **{format_amount(int(bet * MINES_MULTIPLIER_STEP))} "
+            f"(1.41x)**"
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="history", description="View recent balance changes")

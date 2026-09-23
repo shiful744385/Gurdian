@@ -1,0 +1,1 @@
+- [Discord game economy](discord-game-economy.md) — interactive games must use guild-scoped balances and atomic debit/settlement transactions.

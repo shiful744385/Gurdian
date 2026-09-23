@@ -10,6 +10,7 @@ Python Discord bot for server utilities and a persistent per-server economy.
 - `/leaderboard` — see the top balances
 - `/hunt` — find a weighted random animal
 - `/inventory [member]` — view collected animals
+- `/mine bet [mines]` — play a 3×3 Mines game; choose 1–8 mines
 - `/history [member]` — view recent balance changes, including shop purchases
 - `/shop list` — browse this server's shop
 - `/shop buy item` — purchase a shop item with credits
@@ -22,6 +23,7 @@ Python Discord bot for server utilities and a persistent per-server economy.
 - `/economy shop remove item` — remove a shop item (Manage Server)
 
 Balances, balance history, shop items, hunt history, and inventories are stored in `data/economy.sqlite3`. Each Discord server has an isolated economy and inventory.
+Mines bets and payouts are charged atomically and recorded in balance history. A game times out after five minutes without returning the bet.
 Shop purchases are charged atomically and are recorded in balance history. Role rewards require the bot to have
 Manage Roles and its highest role to be above the reward role.
 
