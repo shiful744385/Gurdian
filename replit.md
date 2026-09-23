@@ -1,15 +1,17 @@
-# [Project name]
+# Discord Economy Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A Python Discord bot that provides server utilities and a persistent custom economy per server.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `python -m discord_bot.main` — run the Discord bot
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required secret: `DISCORD_BOT_TOKEN`
+- Optional env: `DISCORD_GUILD_ID` for immediate slash-command sync to one development server
 
 ## Stack
 
@@ -22,23 +24,26 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `discord_bot/main.py` — Discord client and slash commands
+- `discord_bot/database.py` — SQLite economy persistence and atomic balance operations
+- `discord_bot/README.md` — setup and command reference
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Economy balances are scoped by `(guild_id, user_id)` so servers never share currency.
+- SQLite uses WAL mode and short atomic transactions to keep transfers safe.
+- Slash commands are synced to `DISCORD_GUILD_ID` when provided, otherwise globally.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
-
-## User preferences
-
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Members can check balances, claim daily credits, pay each other, and view a leaderboard.
+- Moderators with Manage Server can grant, remove, or set balances.
+- The bot also provides a basic `/serverinfo` utility command.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Global slash-command sync can take time to appear; set `DISCORD_GUILD_ID` during development.
+- Invite the bot with both `bot` and `applications.commands` scopes.
 
 ## Pointers
 

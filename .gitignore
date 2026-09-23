@@ -36,6 +36,9 @@ npm-debug.log
 yarn-error.log
 testem.log
 /typings
+/__pycache__/
+*.py[cod]
+/data/*.sqlite3
 
 # System Files
 .DS_Store

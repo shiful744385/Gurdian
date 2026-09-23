@@ -1,0 +1,8 @@
+[project]
+name = "discord-economy-bot"
+version = "0.1.0"
+description = "Discord server utility and custom economy bot"
+requires-python = ">=3.11"
+dependencies = [
+    "discord-py>=2.7.1",
+]
