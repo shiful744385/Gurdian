@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import {
   Client,
   GatewayIntentBits,
@@ -27,6 +28,38 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
+
+const healthPort = process.env.PORT ? Number(process.env.PORT) : null;
+let healthServer;
+
+function startHealthServer() {
+  if (healthPort == null) return;
+  if (!Number.isInteger(healthPort) || healthPort <= 0) {
+    throw new Error(`Invalid PORT value: "${process.env.PORT}"`);
+  }
+
+  healthServer = createServer((request, response) => {
+    if (request.url !== "/healthz" || !["GET", "HEAD"].includes(request.method ?? "")) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+
+    const body = JSON.stringify({
+      service: "discord-economy-bot",
+      status: client.isReady() ? "ready" : "starting",
+    });
+    response.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": Buffer.byteLength(body),
+    });
+    response.end(request.method === "HEAD" ? undefined : body);
+  });
+
+  healthServer.listen(healthPort, "0.0.0.0", () => {
+    console.log(`Health server listening on port ${healthPort}`);
+  });
+}
 
 async function registerSlashCommands() {
   const rest = new REST({ version: "10" }).setToken(token);
@@ -83,7 +116,23 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-process.on("SIGTERM", () => client.destroy());
-process.on("SIGINT", () => client.destroy());
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Received ${signal}; shutting down`);
+  client.destroy();
+  if (healthServer) {
+    await new Promise((resolve) => healthServer.close(resolve));
+  }
+}
 
-client.login(token);
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
+
+startHealthServer();
+client.login(token).catch(async (error) => {
+  console.error("Discord login failed:", error);
+  await shutdown("login failure");
+  process.exitCode = 1;
+});

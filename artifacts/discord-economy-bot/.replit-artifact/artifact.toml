@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Discord Economy Bot"
+description = "An always-on Discord economy worker with persistent guild-scoped balances, rewards, transfers, leaderboards, and interactive games backed by SQLite."
+version = "1.0.0"
+id = "artifacts/discord-economy-bot"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/", "/healthz" ]
+localPort = 23884
+
+[services.development]
+run = "pnpm --filter @workspace/discord-economy-bot run dev"
+
+[services.production]
+
+[services.production.run]
+args = [ "node", "index.js" ]
+
+[services.production.run.env]
+PORT = "23884"
+NODE_ENV = "production"
+
+[services.production.health.startup]
+path = "/healthz"
+
+[services.env]
+PORT = "23884"
+BASE_PATH = "/"
