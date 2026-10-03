@@ -15,6 +15,7 @@ import { SecurityStore } from "./src/security/store.js";
 const token = process.env.DISCORD_TOKEN || process.env.DISCORD_BOT_TOKEN;
 const clientId = process.env.CLIENT_ID;
 const guildId = process.env.DISCORD_GUILD_ID;
+const guildMembersIntentEnabled = process.env.DISCORD_GUILD_MEMBERS_INTENT === "true";
 
 if (!token) {
   throw new Error("Missing DISCORD_TOKEN");
@@ -30,12 +31,14 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
     GatewayIntentBits.GuildWebhooks,
+    ...(guildMembersIntentEnabled ? [GatewayIntentBits.GuildMembers] : []),
   ],
 });
-const securityMonitor = new SecurityMonitor(client, securityStore);
+const securityMonitor = new SecurityMonitor(client, securityStore, {
+  memberJoinMonitoringEnabled: guildMembersIntentEnabled,
+});
 securityMonitor.start();
 client.on("error", (error) => console.error("Discord client error:", error));
 client.on("shardError", (error) => console.error("Discord gateway shard error:", error));

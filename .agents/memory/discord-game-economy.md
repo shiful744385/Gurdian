@@ -14,3 +14,9 @@ Security features must use the existing Discord bot and database, with security-
 **Why:** The user requires all current economy and game features and balances to remain intact while security is added to the same bot.
 
 **How to apply:** Extend the existing client with security event handling and add isolated security tables; do not create a second bot client or alter economy/game modules for security work.
+
+The Discord app must have the privileged Server Members intent enabled before the bot requests member-join events. Without that app setting, the gateway rejects the login.
+
+**Why:** Join-event monitoring is useful for anti-raid protection, but requiring an unavailable privileged intent can take the existing economy bot offline.
+
+**How to apply:** Keep member-join monitoring opt-in, show its unavailable state clearly, and only enable it after confirming the Discord Developer Portal setting.

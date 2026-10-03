@@ -121,9 +121,10 @@ function isTextMessageChannel(channel) {
 }
 
 export class SecurityMonitor {
-  constructor(client, store) {
+  constructor(client, store, { memberJoinMonitoringEnabled = true } = {}) {
     this.client = client;
     this.store = store;
+    this.memberJoinMonitoringEnabled = memberJoinMonitoringEnabled;
     this.actionWindows = new Map();
     this.joinWindows = new Map();
     this.messageWindows = new Map();
@@ -138,9 +139,11 @@ export class SecurityMonitor {
     this.client.on("guildAuditLogEntryCreate", (entry, guild) => {
       void this.guard("audit entry", () => this.handleAuditEntry(entry, guild));
     });
-    this.client.on("guildMemberAdd", (member) => {
-      void this.guard("member join", () => this.handleMemberJoin(member));
-    });
+    if (this.memberJoinMonitoringEnabled) {
+      this.client.on("guildMemberAdd", (member) => {
+        void this.guard("member join", () => this.handleMemberJoin(member));
+      });
+    }
     this.client.on("messageCreate", (message) => {
       void this.guard("message scan", () => this.handleMessage(message));
     });

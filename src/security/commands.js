@@ -234,9 +234,14 @@ function settingLabel(key) {
   return featureLabels.find(([setting]) => setting === key)?.[1] ?? key;
 }
 
-function configSummary(config) {
+function configSummary(config, memberJoinMonitoringEnabled) {
   const features = featureLabels
-    .map(([key, label]) => `${config[key] ? "ON" : "OFF"} · ${label}`)
+    .map(([key, label]) => {
+      const intentNote = key === "antiRaid" && !memberJoinMonitoringEnabled
+        ? " (needs Server Members intent)"
+        : "";
+      return `${config[key] ? "ON" : "OFF"} · ${label}${intentNote}`;
+    })
     .join("\n");
   return (
     `System: **${config.enabled ? "Enabled" : "Disabled"}**\n` +
@@ -272,13 +277,16 @@ async function dashboard(interaction, securityStore, monitor) {
   ];
   const permissions = criticalPermissions
     .map(([label, permission]) => `${botMember?.permissions.has(permission) ? "Ready" : "Missing"} · ${label}`)
+    .concat(
+      `${monitor?.memberJoinMonitoringEnabled ? "Ready" : "Unavailable"} · Server Members intent`,
+    )
     .join("\n");
   const protectedCount = securityStore.listProtected(guild.id).length;
   const whitelistCount = securityStore.listAllowlist(guild.id).length;
   const embed = new EmbedBuilder()
     .setTitle(`${guild.name} · Security Dashboard`)
     .setColor(config.enabled ? 0x347a62 : 0x777777)
-    .setDescription(configSummary(config))
+    .setDescription(configSummary(config, monitor?.memberJoinMonitoringEnabled))
     .addFields(
       { name: "Incidents · last 24 hours", value: String(securityStore.incidentCount(guild.id)), inline: true },
       { name: "Trusted entries", value: String(whitelistCount), inline: true },
@@ -298,7 +306,6 @@ async function dashboard(interaction, securityStore, monitor) {
     });
   }
   await interaction.reply({ embeds: [embed], ephemeral: true, allowedMentions: { parse: [] } });
-  void monitor;
 }
 
 async function handleConfig(interaction, securityStore) {
@@ -809,6 +816,8 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
       interaction,
       `Security monitoring enabled with safe default thresholds.\n` +
       `Audit Log permission: **${auditReady ? "available" : "missing"}**\n` +
+      `Server Members intent: **${monitor.memberJoinMonitoringEnabled ? "available" : "not enabled"}**\n` +
+      `${monitor.memberJoinMonitoringEnabled ? "" : "Anti-raid join counting needs Discord's privileged Server Members intent; the bot will otherwise keep running without that event feed.\n"}` +
       `Set an alert channel with \`/security config\` and protect sensitive targets with the protect commands. Automatic actions require the matching Discord permissions.`,
     );
     return;
@@ -820,6 +829,7 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
       interaction,
       `**Security system:** ${config.enabled ? "enabled" : "disabled"}\n` +
       `**View Audit Log:** ${botHas(guild, PermissionFlagsBits.ViewAuditLog) ? "available" : "missing"}\n` +
+      `**Server Members intent:** ${monitor.memberJoinMonitoringEnabled ? "available" : "not enabled; anti-raid join events unavailable"}\n` +
       `**Manage Channels:** ${botHas(guild, PermissionFlagsBits.ManageChannels) ? "available" : "missing"}\n` +
       `**Manage Roles:** ${botHas(guild, PermissionFlagsBits.ManageRoles) ? "available" : "missing"}\n` +
       `**Manage Messages:** ${botHas(guild, PermissionFlagsBits.ManageMessages) ? "available" : "missing"}\n` +
