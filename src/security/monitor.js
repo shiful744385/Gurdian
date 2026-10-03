@@ -121,10 +121,15 @@ function isTextMessageChannel(channel) {
 }
 
 export class SecurityMonitor {
-  constructor(client, store, { memberJoinMonitoringEnabled = true } = {}) {
+  constructor(
+    client,
+    store,
+    { memberJoinMonitoringEnabled = true, guardianLogs = null } = {},
+  ) {
     this.client = client;
     this.store = store;
     this.memberJoinMonitoringEnabled = memberJoinMonitoringEnabled;
+    this.guardianLogs = guardianLogs;
     this.actionWindows = new Map();
     this.joinWindows = new Map();
     this.messageWindows = new Map();
@@ -137,15 +142,15 @@ export class SecurityMonitor {
     if (this.started) return;
     this.started = true;
     this.client.on("guildAuditLogEntryCreate", (entry, guild) => {
-      void this.guard("audit entry", () => this.handleAuditEntry(entry, guild));
+      void this.guard("audit entry", () => this.handleAuditEntry(entry, guild), guild);
     });
     if (this.memberJoinMonitoringEnabled) {
       this.client.on("guildMemberAdd", (member) => {
-        void this.guard("member join", () => this.handleMemberJoin(member));
+        void this.guard("member join", () => this.handleMemberJoin(member), member.guild);
       });
     }
     this.client.on("messageCreate", (message) => {
-      void this.guard("message scan", () => this.handleMessage(message));
+      void this.guard("message scan", () => this.handleMessage(message), message.guild);
     });
     this.client.on("webhooksUpdate", (channel) => {
       void this.guard("webhook update", async () => {
@@ -158,15 +163,22 @@ export class SecurityMonitor {
             details: `Webhooks changed in #${channel.name}. Reviewing audit events.`,
           });
         }
-      });
+      }, channel.guild);
     });
   }
 
-  async guard(label, callback) {
+  async guard(label, callback, guild = null) {
     try {
       await callback();
     } catch (error) {
       console.error(`[Security] ${label} handler failed:`, error);
+      if (guild) {
+        await this.guardianLogs?.logToGuild(guild, {
+          title: `Security handler error: ${label}`,
+          description: `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`,
+          severity: "high",
+        });
+      }
     }
   }
 
@@ -205,6 +217,13 @@ export class SecurityMonitor {
 
   async incident(guild, incident) {
     const incidentId = this.store.recordIncident({ guildId: guild.id, ...incident });
+    const actorLine = incident.actorId ? `\nActor ID: ${incident.actorId}` : "";
+    const targetLine = incident.targetId ? `\nTarget ID: ${incident.targetId}` : "";
+    void this.guardianLogs?.logToGuild(guild, {
+      title: `Security action · ${incident.category}`,
+      severity: incident.severity ?? "medium",
+      description: `${incident.details}${actorLine}${targetLine}\nIncident: #${incidentId}`,
+    });
     const cooldownKey = `${guild.id}:${incident.category}:${incident.actorId ?? incident.targetId ?? "all"}`;
     const now = Date.now();
     const lastSent = this.alertCooldowns.get(cooldownKey) ?? 0;
@@ -248,8 +267,10 @@ export class SecurityMonitor {
   }
 
   async handleAuditEntry(entry, guild) {
-    if (!guild || !entry || !this.store.getConfig(guild.id).enabled) return;
+    if (!guild || !entry) return;
+    void this.guardianLogs?.logAuditEntry(guild, entry);
     const config = this.store.getConfig(guild.id);
+    if (!config.enabled) return;
     const action = entry.action;
     const actorId = entry.executorId ?? entry.executor?.id ?? null;
     const targetId = entry.targetId ?? entry.target?.id ?? null;

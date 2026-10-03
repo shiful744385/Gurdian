@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { PermissionFlagsBits, PermissionsBitField } from "discord.js";
 import { securityCommandData } from "../src/security/commands.js";
+import {
+  buildGuardianLogOverwrites,
+  GUARDIAN_LOG_CHANNEL_NAME,
+} from "../src/security/guardian-logs.js";
 import { SecurityStore } from "../src/security/store.js";
 
 function temporaryDatabase(t) {
@@ -31,6 +36,56 @@ test("security command registers the requested management subcommands", () => {
     "verify",
     "test",
   ]);
+});
+
+test("GuardianX log channel denies everyone and grants only bot/admin visibility", () => {
+  const guild = {
+    id: "guild-1",
+    roles: {
+      cache: new Map([
+        [
+          "manage-guild",
+          {
+            id: "manage-guild",
+            position: 5,
+            permissions: new PermissionsBitField(PermissionFlagsBits.ManageGuild),
+          },
+        ],
+        [
+          "administrator",
+          {
+            id: "administrator",
+            position: 10,
+            permissions: new PermissionsBitField(PermissionFlagsBits.Administrator),
+          },
+        ],
+        [
+          "member",
+          {
+            id: "member",
+            position: 1,
+            permissions: new PermissionsBitField(PermissionFlagsBits.SendMessages),
+          },
+        ],
+      ]),
+    },
+  };
+  const overwrites = buildGuardianLogOverwrites(guild, "bot-1");
+
+  assert.equal(GUARDIAN_LOG_CHANNEL_NAME, "🔐・guardian-logs");
+  assert.deepEqual(overwrites[0], {
+    id: "guild-1",
+    type: 0,
+    deny: ["ViewChannel"],
+  });
+  assert.deepEqual(overwrites[1], {
+    id: "bot-1",
+    type: 1,
+    allow: ["ViewChannel", "ReadMessageHistory", "SendMessages", "EmbedLinks"],
+  });
+  assert.ok(overwrites.some((overwrite) => overwrite.id === "manage-guild"));
+  assert.ok(!overwrites.some((overwrite) => overwrite.id === "member"));
+  assert.ok(!overwrites.some((overwrite) => overwrite.id === "administrator"));
 });
 
 test("security persistence is guild-scoped and leaves economy rows unchanged", (t) => {

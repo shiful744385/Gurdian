@@ -9,6 +9,7 @@ import { EconomyStore } from "./src/economy.js";
 import { handlePrefixMessage, handleSlashCommand, slashCommands } from "./src/commands.js";
 import { handleGameInteraction, startAviator, startMines, startWheel } from "./src/games.js";
 import { handleSecurityCommand, handleVerificationButton, securityCommandData } from "./src/security/commands.js";
+import { GuardianLogs } from "./src/security/guardian-logs.js";
 import { SecurityMonitor } from "./src/security/monitor.js";
 import { SecurityStore } from "./src/security/store.js";
 
@@ -33,15 +34,19 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildModeration,
     GatewayIntentBits.GuildWebhooks,
+    GatewayIntentBits.GuildInvites,
     ...(guildMembersIntentEnabled ? [GatewayIntentBits.GuildMembers] : []),
   ],
 });
-const securityMonitor = new SecurityMonitor(client, securityStore, {
+const guardianLogs = new GuardianLogs(client, {
   memberJoinMonitoringEnabled: guildMembersIntentEnabled,
 });
+guardianLogs.start();
+const securityMonitor = new SecurityMonitor(client, securityStore, {
+  memberJoinMonitoringEnabled: guildMembersIntentEnabled,
+  guardianLogs,
+});
 securityMonitor.start();
-client.on("error", (error) => console.error("Discord client error:", error));
-client.on("shardError", (error) => console.error("Discord gateway shard error:", error));
 
 const healthPort = process.env.PORT ? Number(process.env.PORT) : null;
 let healthServer;
@@ -108,6 +113,11 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (error) {
     console.error("Interaction error:", error);
+    void guardianLogs.logToGuild(interaction.guild, {
+      title: "Bot command error",
+      description: `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`,
+      severity: "high",
+    });
     const payload = { content: "❌ Something went wrong while running that command.", ephemeral: true };
     if (interaction.replied || interaction.deferred) await interaction.followUp(payload).catch(() => {});
     else await interaction.reply(payload).catch(() => {});
@@ -134,6 +144,11 @@ client.on("messageCreate", async (message) => {
     await handlePrefixMessage(message, { store, client });
   } catch (error) {
     console.error("Prefix command error:", error);
+    void guardianLogs.logToGuild(message.guild, {
+      title: "Bot command error",
+      description: `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`,
+      severity: "high",
+    });
     await message.reply("❌ Something went wrong while running that command.").catch(() => {});
   }
 });
@@ -152,7 +167,13 @@ async function shutdown(signal) {
 
 process.once("uncaughtException", (error) => {
   console.error("Fatal uncaught exception:", error);
-  void shutdown("uncaught exception").finally(() => process.exit(1));
+  void guardianLogs
+    .logToAllGuilds(
+      "Fatal process error",
+      `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`,
+      "critical",
+    )
+    .finally(() => shutdown("uncaught exception").finally(() => process.exit(1)));
 });
 
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
