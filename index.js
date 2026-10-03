@@ -8,6 +8,9 @@ import {
 import { EconomyStore } from "./src/economy.js";
 import { handlePrefixMessage, handleSlashCommand, slashCommands } from "./src/commands.js";
 import { handleGameInteraction, startAviator, startMines, startWheel } from "./src/games.js";
+import { handleSecurityCommand, handleVerificationButton, securityCommandData } from "./src/security/commands.js";
+import { SecurityMonitor } from "./src/security/monitor.js";
+import { SecurityStore } from "./src/security/store.js";
 
 const token = process.env.DISCORD_TOKEN || process.env.DISCORD_BOT_TOKEN;
 const clientId = process.env.CLIENT_ID;
@@ -21,13 +24,21 @@ if (!clientId) {
 }
 
 const store = new EconomyStore(process.env.ECONOMY_DATABASE_PATH || "data/economy.sqlite3");
+const securityStore = new SecurityStore(process.env.ECONOMY_DATABASE_PATH || "data/economy.sqlite3");
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildWebhooks,
   ],
 });
+const securityMonitor = new SecurityMonitor(client, securityStore);
+securityMonitor.start();
+client.on("error", (error) => console.error("Discord client error:", error));
+client.on("shardError", (error) => console.error("Discord gateway shard error:", error));
 
 const healthPort = process.env.PORT ? Number(process.env.PORT) : null;
 let healthServer;
@@ -66,7 +77,7 @@ async function registerSlashCommands() {
   const route = guildId
     ? Routes.applicationGuildCommands(clientId, guildId)
     : Routes.applicationCommands(clientId);
-  await rest.put(route, { body: slashCommands() });
+  await rest.put(route, { body: [...slashCommands(), securityCommandData] });
   console.log(guildId ? `Registered commands in guild ${guildId}` : "Registered global commands");
 }
 
@@ -78,10 +89,18 @@ client.once("ready", async (readyClient) => {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("security:verify:")) {
+        await handleVerificationButton(interaction, securityStore);
+        return;
+      }
       await handleGameInteraction(interaction, store);
       return;
     }
     if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "security") {
+        await handleSecurityCommand(interaction, { securityStore, monitor: securityMonitor });
+        return;
+      }
       await handleSlashCommand(interaction, { store, client });
     }
   } catch (error) {
@@ -122,10 +141,16 @@ async function shutdown(signal) {
   shuttingDown = true;
   console.log(`Received ${signal}; shutting down`);
   client.destroy();
+  securityStore.close();
   if (healthServer) {
     await new Promise((resolve) => healthServer.close(resolve));
   }
 }
+
+process.once("uncaughtException", (error) => {
+  console.error("Fatal uncaught exception:", error);
+  void shutdown("uncaught exception").finally(() => process.exit(1));
+});
 
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 process.once("SIGINT", () => void shutdown("SIGINT"));

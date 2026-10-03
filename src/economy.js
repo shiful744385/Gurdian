@@ -2,10 +2,12 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const STARTING_BALANCE = 250;
+const STARTING_BALANCE = 250n;
 const DAILY_REWARD = 100;
 const DAILY_COOLDOWN = 86_400;
 const WORK_COOLDOWN = 3_600;
+const EXISTING_USER_BONUS = 1_000_000_000_000n;
+const EXISTING_USER_BONUS_MIGRATION = "existing-user-1-trillion-bonus-v1";
 
 export class EconomyStore {
   constructor(databasePath = "data/economy.sqlite3") {
@@ -14,6 +16,7 @@ export class EconomyStore {
     this.db = new DatabaseSync(resolvedPath, { readBigInts: true });
     this.db.exec("PRAGMA journal_mode = WAL");
     this.initialize();
+    this.applyExistingUserBonus();
   }
 
   initialize() {
@@ -42,6 +45,11 @@ export class EconomyStore {
         last_work INTEGER NOT NULL,
         PRIMARY KEY (guild_id, user_id)
       );
+
+      CREATE TABLE IF NOT EXISTS economy_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+      );
     `);
 
     const columns = this.db
@@ -51,6 +59,43 @@ export class EconomyStore {
     if (!columns.includes("bank_balance")) {
       this.db.exec(
         "ALTER TABLE economy_users ADD COLUMN bank_balance INTEGER NOT NULL DEFAULT 0 CHECK (bank_balance >= 0)",
+      );
+    }
+  }
+
+  applyExistingUserBonus() {
+    const result = this.transaction(() => {
+      const applied = this.db
+        .prepare(
+          "INSERT OR IGNORE INTO economy_migrations (name, applied_at) VALUES (?, ?)",
+        )
+        .run(EXISTING_USER_BONUS_MIGRATION, this.now());
+
+      if (Number(applied.changes) !== 1) {
+        return { applied: false, users: 0 };
+      }
+
+      const users = this.db
+        .prepare("SELECT guild_id, user_id FROM economy_users")
+        .all();
+      this.db
+        .prepare("UPDATE economy_users SET balance = balance + ?")
+        .run(EXISTING_USER_BONUS);
+      for (const user of users) {
+        this.recordTransaction(
+          user.guild_id,
+          null,
+          user.user_id,
+          EXISTING_USER_BONUS,
+          "one-time existing-user bonus",
+        );
+      }
+      return { applied: true, users: users.length };
+    });
+
+    if (result.applied) {
+      console.log(
+        `Applied ${EXISTING_USER_BONUS.toString()}-coin bonus to ${result.users} existing users`,
       );
     }
   }
@@ -94,9 +139,9 @@ export class EconomyStore {
     return {
       guildId: String(row.guild_id),
       userId: String(row.user_id),
-      balance: Number(row.balance),
-      bankBalance: Number(row.bank_balance ?? 0),
-      total: Number(row.balance) + Number(row.bank_balance ?? 0),
+      balance: BigInt(row.balance),
+      bankBalance: BigInt(row.bank_balance ?? 0),
+      total: BigInt(row.balance) + BigInt(row.bank_balance ?? 0),
       lastDaily: row.last_daily == null ? null : Number(row.last_daily),
     };
   }
@@ -130,7 +175,7 @@ export class EconomyStore {
            WHERE guild_id = ? AND user_id = ?`,
         )
         .run(DAILY_REWARD, now, guildId, userId);
-      this.recordTransaction(guildId, null, userId, DAILY_REWARD, "daily reward");
+      this.recordTransaction(guildId, null, userId, BigInt(DAILY_REWARD), "daily reward");
       return {
         claimed: true,
         amount: DAILY_REWARD,
@@ -156,7 +201,7 @@ export class EconomyStore {
         };
       }
 
-      const amount = 100 + Math.floor(Math.random() * 401);
+      const amount = BigInt(100 + Math.floor(Math.random() * 401));
       this.db
         .prepare(
           `INSERT INTO work_cooldowns (guild_id, user_id, last_work)
@@ -180,6 +225,7 @@ export class EconomyStore {
   }
 
   deposit(guildId, userId, amount) {
+    const value = BigInt(amount);
     return this.transaction(() => {
       this.ensureUser(guildId, userId);
       const result = this.db
@@ -188,14 +234,15 @@ export class EconomyStore {
            SET balance = balance - ?, bank_balance = bank_balance + ?
            WHERE guild_id = ? AND user_id = ? AND balance >= ?`,
         )
-        .run(amount, amount, guildId, userId, amount);
+        .run(value, value, guildId, userId, value);
       if (Number(result.changes) !== 1) return { success: false, account: this.account(guildId, userId) };
-      this.recordTransaction(guildId, userId, null, amount, "deposit");
+      this.recordTransaction(guildId, userId, null, value, "deposit");
       return { success: true, account: this.account(guildId, userId) };
     });
   }
 
   withdraw(guildId, userId, amount) {
+    const value = BigInt(amount);
     return this.transaction(() => {
       this.ensureUser(guildId, userId);
       const result = this.db
@@ -204,14 +251,15 @@ export class EconomyStore {
            SET balance = balance + ?, bank_balance = bank_balance - ?
            WHERE guild_id = ? AND user_id = ? AND bank_balance >= ?`,
         )
-        .run(amount, amount, guildId, userId, amount);
+        .run(value, value, guildId, userId, value);
       if (Number(result.changes) !== 1) return { success: false, account: this.account(guildId, userId) };
-      this.recordTransaction(guildId, null, userId, amount, "withdraw");
+      this.recordTransaction(guildId, null, userId, value, "withdraw");
       return { success: true, account: this.account(guildId, userId) };
     });
   }
 
   transfer(guildId, fromUserId, toUserId, amount) {
+    const value = BigInt(amount);
     return this.transaction(() => {
       this.ensureUser(guildId, fromUserId);
       this.ensureUser(guildId, toUserId);
@@ -220,7 +268,7 @@ export class EconomyStore {
           `UPDATE economy_users SET balance = balance - ?
            WHERE guild_id = ? AND user_id = ? AND balance >= ?`,
         )
-        .run(amount, guildId, fromUserId, amount);
+        .run(value, guildId, fromUserId, value);
       if (Number(result.changes) !== 1) {
         return { success: false, account: this.account(guildId, fromUserId) };
       }
@@ -228,13 +276,14 @@ export class EconomyStore {
         .prepare(
           "UPDATE economy_users SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
         )
-        .run(amount, guildId, toUserId);
-      this.recordTransaction(guildId, fromUserId, toUserId, amount, "member transfer");
+        .run(value, guildId, toUserId);
+      this.recordTransaction(guildId, fromUserId, toUserId, value, "member transfer");
       return { success: true, account: this.account(guildId, fromUserId) };
     });
   }
 
   placeBet(guildId, userId, amount, reason) {
+    const value = BigInt(amount);
     return this.transaction(() => {
       this.ensureUser(guildId, userId);
       const result = this.db
@@ -242,27 +291,29 @@ export class EconomyStore {
           `UPDATE economy_users SET balance = balance - ?
            WHERE guild_id = ? AND user_id = ? AND balance >= ?`,
         )
-        .run(amount, guildId, userId, amount);
+        .run(value, guildId, userId, value);
       if (Number(result.changes) !== 1) return { success: false, account: this.account(guildId, userId) };
-      this.recordTransaction(guildId, userId, null, amount, reason);
+      this.recordTransaction(guildId, userId, null, value, reason);
       return { success: true, account: this.account(guildId, userId) };
     });
   }
 
   payout(guildId, userId, amount, reason) {
+    const value = BigInt(amount);
     return this.transaction(() => {
       this.ensureUser(guildId, userId);
       this.db
         .prepare(
           "UPDATE economy_users SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
         )
-        .run(amount, guildId, userId);
-      this.recordTransaction(guildId, null, userId, amount, reason);
+        .run(value, guildId, userId);
+      this.recordTransaction(guildId, null, userId, value, reason);
       return this.account(guildId, userId);
     });
   }
 
   coinflip(guildId, userId, amount, choice) {
+    const value = BigInt(amount);
     return this.transaction(() => {
       this.ensureUser(guildId, userId);
       const debited = this.db
@@ -270,13 +321,13 @@ export class EconomyStore {
           `UPDATE economy_users SET balance = balance - ?
            WHERE guild_id = ? AND user_id = ? AND balance >= ?`,
         )
-        .run(amount, guildId, userId, amount);
+        .run(value, guildId, userId, value);
       if (Number(debited.changes) !== 1) return { success: false, account: this.account(guildId, userId) };
-      this.recordTransaction(guildId, userId, null, amount, "coinflip bet");
+      this.recordTransaction(guildId, userId, null, value, "coinflip bet");
       const result = Math.random() < 0.5 ? "heads" : "tails";
       const won = result === choice;
-      const winnings = won ? amount * 2 : 0;
-      if (winnings > 0) {
+      const winnings = won ? value * 2n : 0n;
+      if (winnings > 0n) {
         this.db
           .prepare(
             "UPDATE economy_users SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
@@ -306,15 +357,15 @@ export class EconomyStore {
       .all(guildId, limit)
       .map((row) => ({
         userId: String(row.user_id),
-        balance: Number(row.balance),
-        bankBalance: Number(row.bank_balance ?? 0),
-        total: Number(row.total),
+        balance: BigInt(row.balance),
+        bankBalance: BigInt(row.bank_balance ?? 0),
+        total: BigInt(row.total),
       }));
   }
 }
 
 export function formatAmount(amount) {
-  return `${Number(amount).toLocaleString("en-US")} credits`;
+  return `${BigInt(amount).toLocaleString("en-US")} credits`;
 }
 
 export function formatDuration(seconds) {

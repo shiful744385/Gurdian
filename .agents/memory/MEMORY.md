@@ -1,1 +1,1 @@
-- [Discord game economy](discord-game-economy.md) — interactive games must use guild-scoped balances and atomic debit/settlement transactions.
+- [Discord bot data safety](discord-game-economy.md) — keep game transactions guild-scoped and security persistence isolated from economy/game records.
