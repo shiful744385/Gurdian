@@ -22,6 +22,7 @@ export const DEFAULT_SECURITY_CONFIG = Object.freeze({
   logChannelId: null,
   verificationRoleId: null,
   lockdownSnapshot: null,
+  channelLockSnapshots: {},
 });
 
 export class SecurityStore {

@@ -45,6 +45,12 @@ const RESTORABLE_CHANNEL_TYPES = new Set([
   ChannelType.GuildForum,
   ChannelType.GuildMedia,
 ]);
+const INDIVIDUALLY_LOCKABLE_CHANNEL_TYPES = new Set([
+  ChannelType.GuildText,
+  ChannelType.GuildAnnouncement,
+  ChannelType.GuildForum,
+  ChannelType.GuildMedia,
+]);
 
 function permissionSnapshot(overwrite, flag) {
   if (overwrite?.allow.has(flag)) return true;
@@ -163,6 +169,25 @@ export class SecurityMonitor {
             details: `Webhooks changed in #${channel.name}. Reviewing audit events.`,
           });
         }
+      }, channel.guild);
+    });
+    this.client.on("channelDelete", (channel) => {
+      if (!channel.guild) return;
+      void this.guard("individual channel lockdown cleanup", async () => {
+        const config = this.store.getConfig(channel.guild.id);
+        const snapshots = { ...(config.channelLockSnapshots ?? {}) };
+        if (!snapshots[channel.id]) return;
+        delete snapshots[channel.id];
+        this.store.saveConfig(channel.guild.id, {
+          ...config,
+          channelLockSnapshots: snapshots,
+        });
+        await this.incident(channel.guild, {
+          category: "channel-lock-snapshot-cleared",
+          severity: "medium",
+          targetId: channel.id,
+          details: `The individual lockdown snapshot for deleted channel #${channel.name} was cleared.`,
+        });
       }, channel.guild);
     });
   }
@@ -797,7 +822,7 @@ export class SecurityMonitor {
     await this.incident(guild, {
       category: "lockdown",
       severity: "critical",
-      details: `Emergency lockdown applied to ${changed} channels/categories. ${failures} could not be changed. Messaging permission grants on @everyone, roles, and individual users were temporarily paused. Reason: ${reason}. Use /security unlock to restore the saved permissions.`,
+      details: `Emergency lockdown applied to ${changed} channels/categories. ${failures} could not be changed. Messaging permission grants on @everyone, roles, and individual users were temporarily paused. Reason: ${reason}. Use ?r unlock to restore the saved permissions.`,
     });
     return { success: true, changed, failures };
   }
@@ -848,6 +873,185 @@ export class SecurityMonitor {
     return { success: true, changed, failures };
   }
 
+  async applyChannelLockdown(guild, channel, reason, { confirmSynced = false } = {}) {
+    if (
+      !channel ||
+      channel.guildId !== guild.id ||
+      !INDIVIDUALLY_LOCKABLE_CHANNEL_TYPES.has(channel.type) ||
+      channel.isThread?.() ||
+      typeof channel.permissionOverwrites?.edit !== "function"
+    ) {
+      return { success: false, unsupported: true, changed: 0, failures: 0 };
+    }
+    if (!guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return { success: false, missingPermission: true, changed: 0, failures: 0 };
+    }
+
+    const config = this.store.getConfig(guild.id);
+    if (config.lockdownSnapshot) {
+      return { success: false, serverLocked: true, changed: 0, failures: 0 };
+    }
+    const existingSnapshots = config.channelLockSnapshots ?? {};
+    if (existingSnapshots[channel.id]) {
+      return { success: true, alreadyLocked: true, changed: 0, failures: 0 };
+    }
+
+    const wasSynced = Boolean(channel.permissionsLocked);
+    if (wasSynced && !confirmSynced) {
+      return { success: false, confirmationRequired: true, changed: 0, failures: 0 };
+    }
+
+    const permissions = {};
+    const everyoneOverwrite = channel.permissionOverwrites.cache.get(guild.id);
+    permissions[guild.id] = {
+      type: 0,
+      permissions: Object.fromEntries(
+        LOCKDOWN_FLAGS.map((flag) => [
+          flag,
+          permissionSnapshot(everyoneOverwrite, flag),
+        ]),
+      ),
+    };
+    for (const overwrite of channel.permissionOverwrites.cache.values()) {
+      if (overwrite.id === guild.id) continue;
+      const grantsMessaging = LOCKDOWN_FLAGS.some((flag) => overwrite.allow.has(flag));
+      if (!grantsMessaging) continue;
+      permissions[overwrite.id] = {
+        type: overwrite.type,
+        permissions: Object.fromEntries(
+          LOCKDOWN_FLAGS.map((flag) => [
+            flag,
+            permissionSnapshot(overwrite, flag),
+          ]),
+        ),
+      };
+    }
+
+    const snapshot = { wasSynced, permissions };
+    this.store.saveConfig(guild.id, {
+      ...config,
+      channelLockSnapshots: {
+        ...existingSnapshots,
+        [channel.id]: snapshot,
+      },
+    });
+
+    let changed = 0;
+    let failures = 0;
+    for (const [targetId, overwrite] of Object.entries(permissions)) {
+      try {
+        await channel.permissionOverwrites.edit(
+          targetId,
+          Object.fromEntries(LOCKDOWN_FLAGS.map((flag) => [flag, false])),
+          {
+            type: overwrite.type,
+            reason: `Security channel lockdown: ${reason}`,
+          },
+        );
+        changed += 1;
+      } catch (error) {
+        failures += 1;
+        console.warn(
+          `[Security][${guild.id}] Could not lock channel ${channel.id} for ${targetId}: ${error.message}`,
+        );
+      }
+    }
+
+    if (changed === 0) {
+      await this.incident(guild, {
+        category: "channel-lockdown-failed",
+        severity: "high",
+        targetId: channel.id,
+        details: `Could not apply an individual lockdown to #${channel.name}. The original permission snapshot was kept so ?r unlock-channel can restore it safely; check Manage Channels and the channel permission hierarchy.`,
+      });
+      return { success: false, changed, failures };
+    }
+
+    await this.incident(guild, {
+      category: failures ? "channel-lockdown-partial" : "channel-lockdown",
+      severity: failures ? "high" : "medium",
+      targetId: channel.id,
+      details: `Individual lockdown applied to #${channel.name}: ${changed} permission overwrites changed; ${failures} failed. Use ?r unlock-channel channel:<#${channel.id}> to restore saved messaging permissions.`,
+    });
+    return { success: failures === 0, changed, failures };
+  }
+
+  async removeChannelLockdown(guild, channel) {
+    if (
+      !channel ||
+      channel.guildId !== guild.id ||
+      !INDIVIDUALLY_LOCKABLE_CHANNEL_TYPES.has(channel.type) ||
+      channel.isThread?.() ||
+      typeof channel.permissionOverwrites?.edit !== "function"
+    ) {
+      return { success: false, unsupported: true, changed: 0, failures: 0 };
+    }
+    if (!guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return { success: false, missingPermission: true, changed: 0, failures: 0 };
+    }
+
+    const config = this.store.getConfig(guild.id);
+    if (config.lockdownSnapshot) {
+      return { success: false, serverLocked: true, changed: 0, failures: 0 };
+    }
+    const snapshots = config.channelLockSnapshots ?? {};
+    const snapshot = snapshots[channel.id];
+    if (!snapshot) return { success: false, missing: true, changed: 0, failures: 0 };
+
+    let changed = 0;
+    let failures = 0;
+    let remaining = snapshot;
+    if (snapshot.wasSynced) {
+      try {
+        await channel.lockPermissions();
+        changed = 1;
+      } catch (error) {
+        failures = 1;
+        console.warn(
+          `[Security][${guild.id}] Could not restore permission sync for channel ${channel.id}: ${error.message}`,
+        );
+      }
+    } else {
+      const remainingPermissions = { ...snapshot.permissions };
+      for (const [targetId, overwrite] of Object.entries(snapshot.permissions)) {
+        try {
+          await channel.permissionOverwrites.edit(
+            targetId,
+            overwrite.permissions,
+            {
+              type: overwrite.type,
+              reason: "Security channel lockdown ended; restore saved messaging permissions",
+            },
+          );
+          delete remainingPermissions[targetId];
+          changed += 1;
+        } catch (error) {
+          failures += 1;
+          console.warn(
+            `[Security][${guild.id}] Could not restore channel ${channel.id} permissions for ${targetId}: ${error.message}`,
+          );
+        }
+      }
+      remaining = { ...snapshot, permissions: remainingPermissions };
+    }
+
+    const updatedSnapshots = { ...snapshots };
+    if (failures) updatedSnapshots[channel.id] = remaining;
+    else delete updatedSnapshots[channel.id];
+    this.store.saveConfig(guild.id, {
+      ...config,
+      channelLockSnapshots: updatedSnapshots,
+    });
+
+    await this.incident(guild, {
+      category: failures ? "channel-unlock-partial" : "channel-unlock",
+      severity: failures ? "high" : "medium",
+      targetId: channel.id,
+      details: `Individual lockdown ended for #${channel.name}: ${changed} permission overwrites restored; ${failures} failed.`,
+    });
+    return { success: failures === 0, changed, failures };
+  }
+
   async makeBackup(guild, createdBy) {
     await guild.roles.fetch().catch(() => {});
     const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
@@ -865,6 +1069,7 @@ export class SecurityMonitor {
       securityConfig: {
         ...this.store.getConfig(guild.id),
         lockdownSnapshot: null,
+        channelLockSnapshots: {},
       },
       allowlist: this.store.listAllowlist(guild.id),
       protected: this.store.listProtected(guild.id),

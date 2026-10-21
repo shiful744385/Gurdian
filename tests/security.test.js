@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { PermissionFlagsBits, PermissionsBitField } from "discord.js";
+import {
+  ChannelType,
+  PermissionFlagsBits,
+  PermissionsBitField,
+} from "discord.js";
 import {
   buildGuardianLogOverwrites,
   GUARDIAN_LOG_CHANNEL_NAME,
@@ -15,6 +19,7 @@ import {
   parseSecurityPrefixInvocation,
 } from "../src/security/prefix-commands.js";
 import { SecurityStore } from "../src/security/store.js";
+import { SecurityMonitor } from "../src/security/monitor.js";
 
 function temporaryDatabase(t) {
   const directory = mkdtempSync(join(tmpdir(), "discord-security-test-"));
@@ -31,6 +36,8 @@ test("security management commands are routed through the ?r prefix", () => {
     "logs",
     "lockdown",
     "unlock",
+    "lock-channel",
+    "unlock-channel",
     "whitelist",
     "protect-role",
     "protect-channel",
@@ -122,6 +129,23 @@ test("security prefix accepts only ?r and parses config and whitelist options", 
       },
     },
   );
+  assert.deepEqual(
+    parseSecurityPrefixInvocation("?r lock-channel channel:<#12345678901234567> confirm:true"),
+    {
+      subcommand: "lock-channel",
+      values: {
+        channel: "<#12345678901234567>",
+        confirm: "true",
+      },
+    },
+  );
+  assert.deepEqual(
+    parseSecurityPrefixInvocation("?r unlock-channel #general"),
+    {
+      subcommand: "unlock-channel",
+      values: { channel: "#general", confirm: null },
+    },
+  );
   assert.equal(parseSecurityPrefixInvocation("o balance"), null);
 });
 
@@ -197,6 +221,131 @@ test("security prefix does not change settings if the member cannot receive priv
 
   assert.equal(saveCount, 0);
   assert.match(publicReplies[0], /Enable DMs/);
+});
+
+test("individual channel lockdown saves and restores only that channel's messaging overwrites", async (t) => {
+  const store = new SecurityStore(temporaryDatabase(t));
+  t.after(() => store.close());
+  const monitor = new SecurityMonitor({ user: { id: "bot-1" } }, store);
+  monitor.incident = async () => {};
+  const guild = {
+    id: "guild-1",
+    members: { me: { permissions: { has: () => true } } },
+  };
+  const edits = [];
+  const channel = {
+    id: "channel-1",
+    guildId: guild.id,
+    name: "general",
+    type: ChannelType.GuildText,
+    permissionsLocked: false,
+    isThread: () => false,
+    permissionOverwrites: {
+      cache: new Map([
+        [
+          guild.id,
+          {
+            id: guild.id,
+            type: 0,
+            allow: { has: (permission) => permission === "SendMessages" },
+            deny: { has: () => false },
+          },
+        ],
+        [
+          "role-1",
+          {
+            id: "role-1",
+            type: 0,
+            allow: { has: (permission) => permission === "SendMessagesInThreads" },
+            deny: { has: () => false },
+          },
+        ],
+      ]),
+      edit: async (targetId, permissions) => edits.push({ targetId, permissions }),
+    },
+  };
+
+  const locked = await monitor.applyChannelLockdown(guild, channel, "unit test");
+  assert.equal(locked.success, true);
+  assert.equal(locked.changed, 2);
+  assert.equal(edits[0].permissions.SendMessages, false);
+  assert.equal(edits[1].permissions.SendMessages, false);
+  assert.equal(
+    Object.keys(store.getConfig(guild.id).channelLockSnapshots).length,
+    1,
+  );
+
+  const unlocked = await monitor.removeChannelLockdown(guild, channel);
+  assert.equal(unlocked.success, true);
+  assert.equal(unlocked.changed, 2);
+  assert.equal(edits[2].permissions.SendMessages, true);
+  assert.equal(edits[3].permissions.SendMessagesInThreads, true);
+  assert.equal(
+    Object.keys(store.getConfig(guild.id).channelLockSnapshots).length,
+    0,
+  );
+
+  store.saveConfig(guild.id, {
+    ...store.getConfig(guild.id),
+    lockdownSnapshot: { "server-wide": {} },
+  });
+  const serverLockConflict = await monitor.applyChannelLockdown(guild, channel, "unit test");
+  assert.equal(serverLockConflict.serverLocked, true);
+  assert.equal(edits.length, 4);
+});
+
+test("synced channels require confirmation and are re-synced when unlocked", async (t) => {
+  const store = new SecurityStore(temporaryDatabase(t));
+  t.after(() => store.close());
+  const monitor = new SecurityMonitor({ user: { id: "bot-1" } }, store);
+  monitor.incident = async () => {};
+  const guild = {
+    id: "guild-2",
+    members: { me: { permissions: { has: () => true } } },
+  };
+  const edits = [];
+  let syncRestored = 0;
+  const channel = {
+    id: "channel-2",
+    guildId: guild.id,
+    name: "announcements",
+    type: ChannelType.GuildText,
+    permissionsLocked: true,
+    isThread: () => false,
+    lockPermissions: async () => { syncRestored += 1; },
+    permissionOverwrites: {
+      cache: new Map([
+        [
+          guild.id,
+          {
+            id: guild.id,
+            type: 0,
+            allow: { has: () => false },
+            deny: { has: () => false },
+          },
+        ],
+      ]),
+      edit: async (targetId, permissions) => edits.push({ targetId, permissions }),
+    },
+  };
+
+  const needsConfirmation = await monitor.applyChannelLockdown(guild, channel, "unit test");
+  assert.equal(needsConfirmation.confirmationRequired, true);
+  assert.equal(edits.length, 0);
+
+  const locked = await monitor.applyChannelLockdown(guild, channel, "unit test", {
+    confirmSynced: true,
+  });
+  assert.equal(locked.success, true);
+  assert.equal(store.getConfig(guild.id).channelLockSnapshots[channel.id].wasSynced, true);
+
+  const unlocked = await monitor.removeChannelLockdown(guild, channel);
+  assert.equal(unlocked.success, true);
+  assert.equal(syncRestored, 1);
+  assert.equal(
+    Object.keys(store.getConfig(guild.id).channelLockSnapshots).length,
+    0,
+  );
 });
 
 test("security persistence is guild-scoped and leaves economy rows unchanged", (t) => {

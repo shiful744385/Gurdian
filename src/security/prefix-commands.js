@@ -7,6 +7,7 @@ const HELP_TEXT = [
   "`?r config setting:nuke_limit threshold:5`",
   "`?r config setting:log_channel channel:#security-alerts`",
   "`?r logs limit:10` · `?r lockdown` · `?r unlock`",
+  "`?r lock-channel channel:#general confirm:true` · `?r unlock-channel channel:#general`",
   "`?r whitelist action:add type:user user:@member`",
   "`?r whitelist action:add type:role role:@role`",
   "`?r whitelist action:add type:bot user:@bot`",
@@ -109,6 +110,9 @@ function makeOptionValues(subcommand, positional, named) {
   } else if (subcommand === "protect-channel") {
     values.action = take("action", 0)?.toLowerCase() ?? null;
     values.channel = named.channel ?? positional[1] ?? null;
+  } else if (subcommand === "lock-channel" || subcommand === "unlock-channel") {
+    values.channel = named.channel ?? positional[0] ?? null;
+    values.confirm = named.confirm ?? positional[1] ?? null;
   } else if (subcommand === "restore") {
     values.backup_id = take("backup_id", 0);
     values.confirm = named.confirm ?? positional[1] ?? null;
@@ -159,7 +163,10 @@ async function resolveOptions(message, client, subcommand, values) {
   if (subcommand === "protect-role" && !values.role) {
     values.role = message.mentions.roles.first() ?? null;
   }
-  if (subcommand === "protect-channel" && !values.channel) {
+  if (
+    ["protect-channel", "lock-channel", "unlock-channel"].includes(subcommand) &&
+    !values.channel
+  ) {
     values.channel = message.mentions.channels.first() ?? null;
   }
   if (subcommand === "verify") {

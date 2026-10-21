@@ -69,7 +69,8 @@ function configSummary(config, memberJoinMonitoringEnabled) {
     `Spam: **${config.spamMessageLimit} messages / ${config.spamWindowSeconds}s**\n` +
     `Alert channel: ${config.logChannelId ? `<#${config.logChannelId}>` : "not set"}\n` +
     `Verification role: ${config.verificationRoleId ? `<@&${config.verificationRoleId}>` : "not set"}\n` +
-    `Lockdown: **${config.lockdownSnapshot ? "Active" : "Inactive"}**`
+    `Lockdown: **${config.lockdownSnapshot ? "Active" : "Inactive"}**\n` +
+    `Individual channel lockdowns: **${Object.keys(config.channelLockSnapshots ?? {}).length}**`
   );
 }
 
@@ -398,6 +399,8 @@ async function handleRestore(interaction, securityStore) {
         : null,
       // Keep an in-progress lockdown recoverable rather than replacing it with a backup's stale state.
       lockdownSnapshot: currentConfig.lockdownSnapshot,
+      // Preserve live per-channel lockdowns rather than replacing them with stale backup IDs.
+      channelLockSnapshots: currentConfig.channelLockSnapshots ?? {},
     });
   }
 
@@ -618,6 +621,66 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
   if (subcommand === "protect-channel") return handleProtected(interaction, securityStore, "channel");
   if (subcommand === "restore") return handleRestore(interaction, securityStore);
   if (subcommand === "verify") return handleVerificationPanel(interaction, securityStore);
+  if (subcommand === "lock-channel" || subcommand === "unlock-channel") {
+    const channel = interaction.options.getChannel("channel", true);
+    const locking = subcommand === "lock-channel";
+    const confirmed = interaction.options.getBoolean("confirm") ?? false;
+    if (
+      channel.guildId !== guild.id ||
+      channel.isThread?.() ||
+      !channel.permissionOverwrites?.edit
+    ) {
+      await reply(interaction, "Choose a text, announcement, forum, or media channel in this server (threads are not supported).");
+      return;
+    }
+    if (!botHas(guild, PermissionFlagsBits.ManageChannels)) {
+      await reply(interaction, "The bot needs Manage Channels to lock or unlock an individual channel.");
+      return;
+    }
+    if (locking && channel.permissionsLocked && !confirmed) {
+      await reply(
+        interaction,
+        `This channel inherits permissions from its category. Locking only this channel will add channel-specific overwrites and unsync it. To continue, run \`?r lock-channel channel:<#${channel.id}> confirm:true\`.`,
+      );
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    const result = locking
+      ? await monitor.applyChannelLockdown(
+          guild,
+          channel,
+          `requested by ${interaction.user.tag}`,
+          { confirmSynced: confirmed },
+        )
+      : await monitor.removeChannelLockdown(guild, channel);
+    let content;
+    if (result.confirmationRequired) {
+      content = `This channel inherits permissions from its category. Re-run \`?r lock-channel channel:<#${channel.id}> confirm:true\` to lock only this channel.`;
+    } else if (result.serverLocked) {
+      content = "A server-wide lockdown is active. End it with `?r unlock` before changing an individual channel lock.";
+    } else if (result.alreadyLocked) {
+      content = `#${channel.name} is already locked; its original permission snapshot was preserved.`;
+    } else if (result.missing) {
+      content = `#${channel.name} does not have an active individual lockdown.`;
+    } else if (result.missingPermission) {
+      content = "The bot needs Manage Channels to lock or unlock an individual channel.";
+    } else if (result.unsupported) {
+      content = "That channel type cannot be locked with this command. Choose a text, announcement, forum, or media channel.";
+    } else if (result.failures && locking && result.changed === 0) {
+      content = `The channel lockdown could not be applied. No permission overwrites succeeded, but the recovery snapshot was kept; run \`?r unlock-channel channel:<#${channel.id}>\` to restore safely or check the bot's Manage Channels permission.`;
+    } else if (result.failures) {
+      content = locking
+        ? `The channel lockdown was only partially applied: ${result.changed} permission overwrites succeeded and ${result.failures} failed. The recovery snapshot was kept; use \`?r unlock-channel channel:<#${channel.id}>\` to restore safely, then retry if needed.`
+        : `The channel unlock was only partially applied: ${result.changed} permission overwrites restored and ${result.failures} failed. The remaining recovery snapshot was kept; retry \`?r unlock-channel channel:<#${channel.id}>\` after checking the bot's Manage Channels permission.`;
+    } else if (locking) {
+      content = `#${channel.name} is locked. Messaging and thread creation are paused. Use \`?r unlock-channel channel:<#${channel.id}>\` to restore its saved permissions.`;
+    } else {
+      content = `#${channel.name} is unlocked. ${result.changed} permission overwrites were restored; ${result.failures} failed.`;
+    }
+    await interaction.editReply(content);
+    return;
+  }
 
   if (subcommand === "setup") {
     const config = securityStore.getConfig(guild.id);
@@ -636,7 +699,7 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
       `Audit Log permission: **${auditReady ? "available" : "missing"}**\n` +
       `Server Members intent: **${monitor.memberJoinMonitoringEnabled ? "available" : "not enabled"}**\n` +
       `${monitor.memberJoinMonitoringEnabled ? "" : "Anti-raid join counting needs Discord's privileged Server Members intent; the bot will otherwise keep running without that event feed.\n"}` +
-      `Set an alert channel with \`/security config\` and protect sensitive targets with the protect commands. Automatic actions require the matching Discord permissions.`,
+      `Set an alert channel with \`?r config setting:log_channel channel:#security-alerts\` and protect sensitive targets with the protect commands. Automatic actions require the matching Discord permissions.`,
     );
     return;
   }
@@ -654,7 +717,8 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
       `**Moderate Members:** ${botHas(guild, PermissionFlagsBits.ModerateMembers) ? "available" : "missing"}\n` +
       `**Manage Webhooks:** ${botHas(guild, PermissionFlagsBits.ManageWebhooks) ? "available" : "missing"}\n` +
       `**Alert channel:** ${config.logChannelId ? `<#${config.logChannelId}>` : "not configured"}\n` +
-      `**Lockdown:** ${config.lockdownSnapshot ? "active" : "inactive"}`,
+      `**Server-wide lockdown:** ${config.lockdownSnapshot ? "active" : "inactive"}\n` +
+      `**Individual channel lockdowns:** ${Object.keys(config.channelLockSnapshots ?? {}).length}`,
     );
     return;
   }
@@ -669,7 +733,7 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
     await interaction.editReply(
       result.alreadyLocked
         ? "Lockdown is already active; the original permission snapshot was preserved."
-        : `Lockdown applied to ${result.changed} channels/categories. Failed: ${result.failures}. Use /security unlock to restore saved messaging permissions.`,
+        : `Lockdown applied to ${result.changed} channels/categories. Failed: ${result.failures}. Use ?r unlock to restore saved messaging permissions.`,
     );
     return;
   }
@@ -730,7 +794,7 @@ export async function handleSecurityCommand(interaction, { securityStore, monito
         });
       }
     }
-    await reply(interaction, `Security test stored as incident #${incidentId}. ${config.logChannelId ? "The configured alert channel was tested." : "No alert channel is configured; the incident is available in /security logs."}`);
+    await reply(interaction, `Security test stored as incident #${incidentId}. ${config.logChannelId ? "The configured alert channel was tested." : "No alert channel is configured; the incident is available in ?r logs."}`);
     return;
   }
 
