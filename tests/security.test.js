@@ -5,11 +5,15 @@ import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { PermissionFlagsBits, PermissionsBitField } from "discord.js";
-import { securityCommandData } from "../src/security/commands.js";
 import {
   buildGuardianLogOverwrites,
   GUARDIAN_LOG_CHANNEL_NAME,
 } from "../src/security/guardian-logs.js";
+import {
+  matchesSecurityPrefix,
+  handleSecurityPrefixMessage,
+  parseSecurityPrefixInvocation,
+} from "../src/security/prefix-commands.js";
 import { SecurityStore } from "../src/security/store.js";
 
 function temporaryDatabase(t) {
@@ -18,9 +22,8 @@ function temporaryDatabase(t) {
   return join(directory, "test.sqlite3");
 }
 
-test("security command registers the requested management subcommands", () => {
-  const subcommands = securityCommandData.options.map((option) => option.name);
-  assert.deepEqual(subcommands, [
+test("security management commands are routed through the ?r prefix", () => {
+  const subcommands = [
     "dashboard",
     "status",
     "setup",
@@ -35,7 +38,13 @@ test("security command registers the requested management subcommands", () => {
     "restore",
     "verify",
     "test",
-  ]);
+  ];
+  for (const subcommand of subcommands) {
+    assert.equal(
+      parseSecurityPrefixInvocation(`?r ${subcommand}`).subcommand,
+      subcommand,
+    );
+  }
 });
 
 test("GuardianX log channel denies everyone and grants only bot/admin visibility", () => {
@@ -86,6 +95,108 @@ test("GuardianX log channel denies everyone and grants only bot/admin visibility
   assert.ok(overwrites.some((overwrite) => overwrite.id === "manage-guild"));
   assert.ok(!overwrites.some((overwrite) => overwrite.id === "member"));
   assert.ok(!overwrites.some((overwrite) => overwrite.id === "administrator"));
+});
+
+test("security prefix accepts only ?r and parses config and whitelist options", () => {
+  assert.equal(matchesSecurityPrefix("?r status"), true);
+  assert.equal(matchesSecurityPrefix("  ?R setup"), true);
+  assert.equal(matchesSecurityPrefix("?random status"), false);
+  assert.equal(matchesSecurityPrefix("o balance"), false);
+
+  assert.deepEqual(parseSecurityPrefixInvocation("?r config anti-spam false"), {
+    subcommand: "config",
+    values: {
+      setting: "anti_spam",
+      enabled: "false",
+      clear: null,
+    },
+  });
+  assert.deepEqual(
+    parseSecurityPrefixInvocation("?r whitelist action:add type:user user:<@12345678901234567>"),
+    {
+      subcommand: "whitelist",
+      values: {
+        action: "add",
+        type: "user",
+        user: "<@12345678901234567>",
+      },
+    },
+  );
+  assert.equal(parseSecurityPrefixInvocation("o balance"), null);
+});
+
+test("security prefix updates settings and sends the result privately", async (t) => {
+  const store = new SecurityStore(temporaryDatabase(t));
+  const privateReplies = [];
+  const message = {
+    content: "?r config setting:anti_spam enabled:false",
+    guild: { id: "guild-1" },
+    guildId: "guild-1",
+    member: { permissions: new PermissionsBitField(PermissionFlagsBits.ManageGuild) },
+    mentions: {
+      users: new Map(),
+      roles: new Map(),
+      channels: new Map(),
+    },
+    author: {
+      id: "moderator-1",
+      tag: "moderator#0001",
+      send: async (payload) => {
+        privateReplies.push(payload);
+        return {
+          edit: async (updatedPayload) => {
+            privateReplies.push(updatedPayload);
+            return updatedPayload;
+          },
+        };
+      },
+    },
+    reply: async () => {},
+  };
+
+  await handleSecurityPrefixMessage(message, {
+    client: { users: { fetch: async () => null } },
+    securityStore: store,
+    monitor: { memberJoinMonitoringEnabled: false },
+    guardianLogs: { logToGuild: async () => {} },
+  });
+
+  assert.equal(store.getConfig("guild-1").antiSpam, false);
+  assert.equal(privateReplies[0], "Processing your security command…");
+  assert.match(privateReplies[1].content, /disabled/);
+  store.close();
+});
+
+test("security prefix does not change settings if the member cannot receive private replies", async () => {
+  let saveCount = 0;
+  const publicReplies = [];
+  const message = {
+    content: "?r config setting:anti_spam enabled:false",
+    guild: { id: "guild-1" },
+    guildId: "guild-1",
+    member: { permissions: new PermissionsBitField(PermissionFlagsBits.ManageGuild) },
+    mentions: { users: new Map(), roles: new Map(), channels: new Map() },
+    author: {
+      id: "moderator-1",
+      send: async () => {
+        throw new Error("DMs are disabled");
+      },
+    },
+    reply: async (payload) => publicReplies.push(payload),
+  };
+
+  await handleSecurityPrefixMessage(message, {
+    client: { users: { fetch: async () => null } },
+    securityStore: {
+      getConfig: () => ({ enabled: false, antiSpam: true }),
+      saveConfig: () => { saveCount += 1; },
+    },
+    monitor: { memberJoinMonitoringEnabled: false },
+    guardianLogs: { logToGuild: async () => {} },
+  });
+
+  assert.equal(saveCount, 0);
+  assert.match(publicReplies[0], /Enable DMs/);
 });
 
 test("security persistence is guild-scoped and leaves economy rows unchanged", (t) => {
